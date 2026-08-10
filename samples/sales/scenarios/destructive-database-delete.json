@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "destructive-database-delete",
+  "kind": "destructive",
+  "run_id": "01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a01",
+  "action_id": "01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a03",
+  "action": "database.delete",
+  "resource": "company://primary/all-data",
+  "parameters": {
+    "confirm": "DELETE_ALL",
+    "scope": "company"
+  },
+  "expected": {
+    "effective_risk": "L4",
+    "decision": "deny",
+    "parameter_hash": "1eeee2e8864f76d7ee964f0cd54ef87197e0988372b0c81f4ce1d487d6984e42"
+  }
+}

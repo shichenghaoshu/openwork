@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "risky-email-send",
+  "kind": "risky_external",
+  "run_id": "01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a01",
+  "action_id": "01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a02",
+  "action": "email.send",
+  "resource": "mailto:external@example.net",
+  "parameters": {
+    "attachment": "sales-analysis.csv",
+    "recipient": "external@example.net",
+    "subject": "August sales analysis"
+  },
+  "expected": {
+    "effective_risk": "L3",
+    "decision": "require_approval",
+    "parameter_hash": "51fabbc4f0808fa649e077f42b7ab792a606a8c95265136614fe9a032703c674"
+  }
+}
