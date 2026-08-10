@@ -1,0 +1,117 @@
+name: Compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+
+jobs:
+  native-unix:
+    name: ${{ matrix.name }} (native)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-15
+            rust_host: aarch64-apple-darwin
+          - name: macOS x64
+            runner: macos-15-intel
+            rust_host: x86_64-apple-darwin
+          - name: Ubuntu x64
+            runner: ubuntu-24.04
+            rust_host: x86_64-unknown-linux-gnu
+          - name: Ubuntu arm64
+            runner: ubuntu-24.04-arm
+            rust_host: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the workspace minimum Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Prove the native host architecture
+        run: |
+          rustc -vV
+          rustc -vV | grep -F "host: ${{ matrix.rust_host }}"
+      - name: Test the workspace natively
+        run: cargo test --workspace --all-targets --locked
+      - name: Build and smoke-test the release binary
+        run: |
+          cargo build --release --locked
+          test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
+          target/release/openwork install --dry-run --json > install-plan.json
+          doctor_exit=0
+          target/release/openwork doctor --json > doctor.json || doctor_exit=$?
+          test "$doctor_exit" -eq 0 -o "$doctor_exit" -eq 11
+          test "$(jq -r .schema_version doctor.json)" = "1"
+
+  native-windows:
+    name: Windows x64 (native Server 2025 runner)
+    runs-on: windows-2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the workspace minimum Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup default $env:RUST_TOOLCHAIN
+      - name: Prove the native host architecture
+        shell: pwsh
+        run: |
+          $verbose = rustc -vV
+          $verbose
+          if ($verbose -notcontains "host: x86_64-pc-windows-msvc") {
+            throw "Expected an x86_64-pc-windows-msvc host"
+          }
+      - name: Test the workspace natively
+        run: cargo test --workspace --all-targets --locked
+      - name: Build and smoke-test the release binary
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          $version = & .\target\release\openwork.exe --version
+          if ($version -ne "OpenWork 0.1.0") { throw "Unexpected version: $version" }
+          & .\target\release\openwork.exe install --dry-run --json | Set-Content install-plan.json
+          & .\target\release\openwork.exe doctor --json | Set-Content doctor.json
+          if ($LASTEXITCODE -notin 0, 11) { throw "Unexpected Doctor exit: $LASTEXITCODE" }
+          $doctor = Get-Content doctor.json -Raw | ConvertFrom-Json
+          if ($doctor.schema_version -ne 1) { throw "Unexpected Doctor schema" }
+
+  installer-syntax:
+    name: Installer syntax
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Parse the POSIX installer
+        run: sh -n scripts/install.sh
+      - name: Parse the PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -ne 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }

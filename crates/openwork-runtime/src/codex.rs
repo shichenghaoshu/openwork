@@ -148,13 +148,13 @@ impl AgentRuntime for CodexRuntime {
                     "-File".to_owned(),
                     destination.to_string_lossy().into_owned(),
                 ],
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
         } else {
             CommandSpec::new(
                 "/bin/sh",
                 vec![destination.to_string_lossy().into_owned()],
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
         };
         let context = if self.platform.environment == HostEnvironment::Wsl {

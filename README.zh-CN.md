@@ -40,4 +40,10 @@ cargo build --release
 ./target/release/openwork install --dry-run --json
 ```
 
+五个 Tier 1 原生构建目标的发布包由 [POSIX](scripts/install.sh) 与
+[PowerShell](scripts/install.ps1) 脚本安装；脚本会先
+校验 SHA-256，默认拒绝覆盖现有二进制，只有显式 force 才会先备份再替换。参见
+[发布检查清单](docs/release/checklist.md)与可复现的
+[Bootstrap 演示](docs/demo/bootstrap-runtime.md)。
+
 平台支持证据见 [platform-support.md](docs/platform-support.md)，fixture、CI 烟测和真机验证不会混为一谈。

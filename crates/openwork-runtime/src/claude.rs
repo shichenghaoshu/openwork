@@ -148,13 +148,13 @@ impl AgentRuntime for ClaudeRuntime {
                     "-File".to_owned(),
                     destination.to_string_lossy().into_owned(),
                 ],
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
         } else {
             CommandSpec::new(
                 "/bin/bash",
                 vec![destination.to_string_lossy().into_owned()],
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
         };
         let mut warnings = vec![

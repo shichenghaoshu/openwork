@@ -40,5 +40,12 @@ cargo build --release
 ./target/release/openwork install --dry-run --json
 ```
 
+Release archives for the five native Tier 1 build targets are installed by the
+checksum-verifying [POSIX](scripts/install.sh) and [PowerShell](scripts/install.ps1)
+scripts. Existing binaries are refused
+unless an explicit force option creates a backup first. See the
+[release checklist](docs/release/checklist.md) and reproducible
+[Bootstrap demo](docs/demo/bootstrap-runtime.md).
+
 See the [platform evidence matrix](docs/platform-support.md) for the difference
 between fixtures, CI smoke tests, and real-host validation.

@@ -1,0 +1,249 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  validate-tag:
+    name: Validate immutable release input
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate tag format before checkout
+        run: |
+          printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' || {
+            echo "release tag must be a v-prefixed SemVer value" >&2
+            exit 2
+          }
+      - name: Check out the exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Require an existing immutable tag
+        run: |
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          workspace_version=$(awk '
+            /^\[workspace.package\]$/ { in_workspace = 1; next }
+            /^\[/ { in_workspace = 0 }
+            in_workspace && /^version = / {
+              gsub(/^[^"]*"|".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+          tag_version=${RELEASE_TAG#v}
+          tag_version=${tag_version%%[-+]*}
+          test -n "$workspace_version"
+          test "$tag_version" = "$workspace_version" || {
+            echo "tag version $tag_version does not match workspace version $workspace_version" >&2
+            exit 2
+          }
+
+  build-unix:
+    name: Package ${{ matrix.target }}
+    needs: validate-tag
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Install the workspace minimum Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Prove the native build host
+        run: |
+          rustc -vV | grep -F "host: ${{ matrix.target }}"
+      - name: Test and build from Cargo.lock
+        run: |
+          cargo test --workspace --all-targets --locked
+          cargo build --release --locked
+          binary_version=${RELEASE_TAG#v}
+          binary_version=${binary_version%%[-+]*}
+          test "$(target/release/openwork --version)" = "OpenWork $binary_version"
+      - name: Create the auditable archive and checksum
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          source_commit=$(git rev-parse HEAD)
+          asset="openwork-${RELEASE_TAG}-${RELEASE_TARGET}"
+          mkdir -p "staging/$asset" dist
+          install -m 0755 target/release/openwork "staging/$asset/openwork"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "staging/$asset/"
+          printf '{\n  "schema_version": 1,\n  "tag": "%s",\n  "commit": "%s",\n  "target": "%s",\n  "rust_toolchain": "%s",\n  "cargo_locked": true\n}\n' \
+            "$RELEASE_TAG" "$source_commit" "$RELEASE_TARGET" "$RUST_TOOLCHAIN" \
+            > "staging/$asset/build-provenance.json"
+          tar -C staging -czf "dist/$asset.tar.gz" "$asset"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
+          else
+            shasum -a 256 "$asset.tar.gz" > "$asset.tar.gz.sha256"
+          fi
+      - name: Attest the archive provenance
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/openwork-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+      - name: Upload packaged files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: Package x86_64-pc-windows-msvc
+    needs: validate-tag
+    runs-on: windows-2025
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Install the workspace minimum Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup default $env:RUST_TOOLCHAIN
+      - name: Test and build from Cargo.lock
+        shell: pwsh
+        run: |
+          $hostInfo = rustc -vV
+          if ($hostInfo -notcontains "host: x86_64-pc-windows-msvc") { throw "Unexpected Rust host" }
+          cargo test --workspace --all-targets --locked
+          cargo build --release --locked
+          $binaryVersion = $env:RELEASE_TAG.Substring(1).Split([char[]]@('-', '+'))[0]
+          if ((& .\target\release\openwork.exe --version) -ne "OpenWork $binaryVersion") {
+            throw "Unexpected OpenWork version"
+          }
+      - name: Create the auditable archive and checksum
+        shell: pwsh
+        run: |
+          $sourceCommit = git rev-parse HEAD
+          $target = "x86_64-pc-windows-msvc"
+          $asset = "openwork-$env:RELEASE_TAG-$target"
+          New-Item -ItemType Directory -Force "staging\$asset", "dist" | Out-Null
+          Copy-Item .\target\release\openwork.exe "staging\$asset\openwork.exe"
+          Copy-Item LICENSE, NOTICE, THIRD_PARTY_NOTICES.md "staging\$asset\"
+          $provenance = [ordered]@{
+            schema_version = 1
+            tag = $env:RELEASE_TAG
+            commit = $sourceCommit
+            target = $target
+            rust_toolchain = $env:RUST_TOOLCHAIN
+            cargo_locked = $true
+          } | ConvertTo-Json
+          Set-Content -Path "staging\$asset\build-provenance.json" -Value $provenance -Encoding utf8
+          Compress-Archive -Path "staging\$asset" -DestinationPath "dist\$asset.zip"
+          $hash = (Get-FileHash "dist\$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "dist\$asset.zip.sha256" -Value "$hash  $asset.zip" -Encoding ascii
+      - name: Attest the archive provenance
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/openwork-${{ env.RELEASE_TAG }}-x86_64-pc-windows-msvc.zip
+      - name: Upload packaged files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-x86_64-pc-windows-msvc
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate the SPDX dependency SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/openwork-${{ env.RELEASE_TAG }}-sbom.spdx.json
+          artifact-name: openwork-${{ env.RELEASE_TAG }}-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          syft-version: v1.50.0
+      - name: Verify and consolidate checksums
+        run: |
+          test "$(find dist -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 5
+          (
+            cd dist
+            for checksum in *.sha256; do
+              sha256sum --check "$checksum"
+            done
+            cat -- *.sha256 > SHA256SUMS.unsorted
+            sha256sum "openwork-${RELEASE_TAG}-sbom.spdx.json" >> SHA256SUMS.unsorted
+            LC_ALL=C sort -k2 SHA256SUMS.unsorted > SHA256SUMS
+            rm SHA256SUMS.unsorted
+            sha256sum SHA256SUMS > SHA256SUMS.sha256
+          )
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=(dist/*)
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            flags=(--verify-tag --generate-notes)
+            case "$RELEASE_TAG" in
+              *-*) flags+=(--prerelease) ;;
+            esac
+            gh release create "$RELEASE_TAG" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OpenWork $RELEASE_TAG" \
+              "${flags[@]}"
+          fi
