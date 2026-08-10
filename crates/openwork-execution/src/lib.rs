@@ -235,6 +235,7 @@ impl SandboxWorkingDirectory {
             && (!value.starts_with("/workspace/")
                 || value.ends_with('/')
                 || value.contains("//")
+                || value.contains('\0')
                 || value
                     .split('/')
                     .any(|segment| segment == ".." || segment == "."))
@@ -1248,6 +1249,7 @@ impl ApprovalRequest {
         self.run_id == action.run_id
             && self.action_id == action.id
             && &self.parameter_hash == action.parameter_hash()
+            && action.parameters_match_hash()
     }
 
     #[must_use]
@@ -1966,6 +1968,17 @@ mod tests {
                 )
                 .is_err()
         );
+        let mut changed_action = action.clone();
+        changed_action.resource = "external".to_owned();
+        assert!(
+            approval
+                .can_consume_at(
+                    &changed_action,
+                    1,
+                    UtcTimestamp::parse("2026-08-10T00:04:00Z").expect("time")
+                )
+                .is_err()
+        );
         assert!(
             UtcTimestamp::parse("2026-08-10T00:00:00.1Z").expect("time")
                 > UtcTimestamp::parse("2026-08-10T00:00:00Z").expect("time")
@@ -2198,6 +2211,18 @@ mod tests {
             "parameter_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         });
         assert!(!validator.is_valid(&invalid_whitespace_action));
+
+        let invalid_workspace_traversal = json!({
+            "schema_version": 1,
+            "run_id": run_id(),
+            "runtime": "mock",
+            "prompt": "safe task",
+            "prompt_hash": sha256_bytes(b"safe task"),
+            "working_directory": "/workspace/../secrets",
+            "timeout_seconds": 300,
+            "capabilities": []
+        });
+        assert!(!validator.is_valid(&invalid_workspace_traversal));
     }
 
     fn run_id() -> RunId {

@@ -306,7 +306,7 @@
         "runtime": { "type": "string", "minLength": 1 },
         "prompt": { "type": "string" },
         "prompt_hash": { "$ref": "#/$defs/sha256" },
-        "working_directory": { "type": "string", "pattern": "^/workspace(?:/[^/]+)*$" },
+        "working_directory": { "type": "string", "pattern": "^/workspace(?:/(?!\\.{1,2}(?:/|$))[^/\\u0000]+)*$" },
         "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "capabilities": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 128 } }
       }

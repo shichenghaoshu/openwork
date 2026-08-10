@@ -100,23 +100,38 @@ impl std::error::Error for OpenWorkError {}
 /// Redacts common credential assignments and token prefixes from diagnostic text.
 #[must_use]
 pub fn redact_text(input: &str) -> String {
+    let words = input.split_whitespace().collect::<Vec<_>>();
+    let mut redacted = Vec::with_capacity(words.len());
     let mut redact_following = 0_usize;
-    input
-        .split_whitespace()
-        .map(|word| {
-            if redact_following > 0 {
-                redact_following -= 1;
-                return "[REDACTED]".to_owned();
-            }
-            if let Some(following) = secret_assignment_tail(word) {
-                redact_following = following;
-                "[REDACTED]".to_owned()
-            } else {
-                redact_word(word)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
+        if redact_following > 0 {
+            redact_following -= 1;
+            redacted.push("[REDACTED]".to_owned());
+            index += 1;
+            continue;
+        }
+        if let Some(authorization) = standalone_secret_key(word)
+            && words
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.trim_matches(['"', '\'', ',', ';']), "=" | ":"))
+        {
+            let available_value_words = words.len().saturating_sub(index + 2);
+            let value_words = if authorization { 2 } else { 1 }.min(available_value_words);
+            redacted.push("[REDACTED]".to_owned());
+            index += 2 + value_words;
+            continue;
+        }
+        if let Some(following) = secret_assignment_tail(word) {
+            redact_following = following;
+            redacted.push("[REDACTED]".to_owned());
+        } else {
+            redacted.push(redact_word(word));
+        }
+        index += 1;
+    }
+    redacted.join(" ")
 }
 
 /// Redacts secret-bearing fields recursively before structured data reaches logs or audit.
@@ -219,6 +234,29 @@ fn secret_assignment_tail(word: &str) -> Option<usize> {
     None
 }
 
+fn standalone_secret_key(word: &str) -> Option<bool> {
+    let normalized = word
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let authorization = normalized == "authorization";
+    let secret = authorization
+        || [
+            "setcookie",
+            "cookie",
+            "password",
+            "clientsecret",
+            "privatekey",
+            "accesskey",
+            "apikey",
+            "secret",
+            "token",
+        ]
+        .contains(&normalized.as_str());
+    secret.then_some(authorization)
+}
+
 fn redact_word(word: &str) -> String {
     const SECRET_KEYS: [&str; 6] = [
         "TOKEN",
@@ -293,5 +331,8 @@ mod tests {
         let redacted_url = redact_text(url);
         assert!(!redacted_url.contains("visible"));
         assert!(redacted_url.ends_with("safe"));
+
+        let separated = redact_text("password = visible safe token : another end");
+        assert_eq!(separated, "[REDACTED] safe [REDACTED] end");
     }
 }
