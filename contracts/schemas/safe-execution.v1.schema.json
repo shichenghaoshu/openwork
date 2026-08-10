@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openwork.dev/contracts/safe-execution.v1.schema.json",
+  "title": "OpenWork M1 Safe Execution Contracts",
+  "oneOf": [
+    { "$ref": "#/$defs/run" },
+    { "$ref": "#/$defs/artifact" },
+    { "$ref": "#/$defs/auditEvent" },
+    { "$ref": "#/$defs/sandboxRequest" },
+    { "$ref": "#/$defs/sandboxResult" },
+    { "$ref": "#/$defs/actionRequest" },
+    { "$ref": "#/$defs/policyEvaluation" },
+    { "$ref": "#/$defs/approvalRequest" },
+    { "$ref": "#/$defs/runtimeTask" },
+    { "$ref": "#/$defs/runtimeEvent" }
+  ],
+  "$defs": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "uuidV7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "actorId": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(?!\\s*$)[\\s\\S]+$" },
+    "canonicalParameter": {
+      "oneOf": [
+        { "type": ["string", "boolean", "null"] },
+        { "type": "integer" },
+        { "type": "array", "items": { "$ref": "#/$defs/canonicalParameter" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/canonicalParameter" } }
+      ]
+    },
+    "relativeArtifactPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*//)(?!.*[/]$)(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9._/-]+$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "id", "runtime", "workspace", "status", "revision", "actor_id", "prompt_sha256", "created_at", "updated_at", "started_at", "completed_at", "terminal_reason"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "id": { "$ref": "#/$defs/uuidV7" },
+        "runtime": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "workspace": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["queued", "planning", "awaiting_approval", "running", "succeeded", "failed", "cancelled", "timed_out"] },
+        "revision": { "type": "integer", "minimum": 0 },
+        "actor_id": { "$ref": "#/$defs/actorId" },
+        "prompt_sha256": { "$ref": "#/$defs/sha256" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "started_at": { "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "completed_at": { "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "terminal_reason": { "type": ["string", "null"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "id", "run_id", "path", "media_type", "size_bytes", "sha256", "created_at"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "id": { "$ref": "#/$defs/uuidV7" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "path": { "$ref": "#/$defs/relativeArtifactPath" },
+        "media_type": { "type": "string", "minLength": 1 },
+        "size_bytes": { "type": "integer", "minimum": 0, "maximum": 104857600 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "auditEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "sequence": { "const": 1 } }, "required": ["sequence"] },
+          "then": { "properties": { "previous_hash": { "type": "null" } } },
+          "else": { "properties": { "previous_hash": { "$ref": "#/$defs/sha256" } } }
+        }
+      ],
+      "required": ["schema_version", "id", "run_id", "sequence", "event_type", "actor", "timestamp", "metadata", "previous_hash", "event_hash"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "id": { "$ref": "#/$defs/uuidV7" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "event_type": { "enum": ["run_created", "runtime_selected", "sandbox_created", "action_requested", "policy_allowed", "policy_denied", "approval_requested", "approval_approved", "approval_denied", "runtime_started", "runtime_output", "artifact_created", "runtime_completed", "sandbox_destroyed", "run_completed", "run_failed", "approval_binding_mismatch"] },
+        "actor": { "$ref": "#/$defs/actorId" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "metadata": { "type": "object" },
+        "previous_hash": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "event_hash": { "$ref": "#/$defs/sha256", "readOnly": true }
+      }
+    },
+    "sandboxCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "arguments", "environment"],
+      "properties": {
+        "program": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/[^\\u0000]*$" },
+        "arguments": { "type": "array", "items": { "type": "string", "maxLength": 8192, "pattern": "^[^\\u0000]*$" }, "maxItems": 256 },
+        "environment": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" },
+          "additionalProperties": { "type": "string", "maxLength": 8192, "pattern": "^[^\\u0000]*$" },
+          "maxProperties": 64
+        }
+      }
+    },
+    "sandboxLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_millis", "memory_bytes", "pid_limit", "timeout_seconds", "max_output_bytes"],
+      "properties": {
+        "cpu_millis": { "type": "integer", "minimum": 1, "maximum": 64000 },
+        "memory_bytes": { "type": "integer", "minimum": 1048576, "maximum": 68719476736 },
+        "pid_limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+      }
+    },
+    "sandboxRequest": {
+      "type": "object",
+      "description": "Trusted internal worker contract; never expose host paths as HTTP caller authority.",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "image", "command", "user", "network", "input_directory", "output_directory", "limits"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "image": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?(?::[0-9]+)?(?:/[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)*@sha256:[0-9a-f]{64}$" },
+        "command": { "$ref": "#/$defs/sandboxCommand" },
+        "user": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["uid", "gid"],
+          "properties": {
+            "uid": { "type": "integer", "minimum": 1 },
+            "gid": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "network": { "const": "disabled" },
+        "input_directory": { "type": "string", "minLength": 1 },
+        "output_directory": { "type": "string", "minLength": 1 },
+        "limits": { "$ref": "#/$defs/sandboxLimits" }
+      }
+    },
+    "sandboxResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "termination": { "const": "exited" } }, "required": ["termination"] },
+          "then": { "properties": { "exit_code": { "type": "integer" } } }
+        },
+        {
+          "if": { "properties": { "termination": { "enum": ["cancelled", "timed_out", "out_of_memory"] } }, "required": ["termination"] },
+          "then": { "properties": { "exit_code": { "type": "null" } } }
+        }
+      ],
+      "required": ["schema_version", "run_id", "sandbox_id", "termination", "exit_code", "stdout", "stderr", "truncated", "started_at", "completed_at", "output_paths", "cleanup"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "sandbox_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "termination": { "enum": ["exited", "cancelled", "timed_out", "out_of_memory", "failed"] },
+        "exit_code": { "type": ["integer", "null"] },
+        "stdout": { "type": "string", "maxLength": 16777216 },
+        "stderr": { "type": "string", "maxLength": 16777216 },
+        "truncated": { "type": "boolean" },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "completed_at": { "$ref": "#/$defs/timestamp" },
+        "output_paths": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/relativeArtifactPath" } },
+        "cleanup": {
+          "oneOf": [
+            { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "const": "succeeded" } } },
+            { "type": "object", "additionalProperties": false, "required": ["status", "error_code"], "properties": { "status": { "const": "failed" }, "error_code": { "type": "string", "pattern": "^[a-z0-9._-]{1,128}$" } } }
+          ]
+        }
+      }
+    },
+    "actionRequest": {
+      "type": "object",
+      "description": "Internal normalized action. Actor and risk come from trusted context and policy, not this object.",
+      "additionalProperties": false,
+      "required": ["schema_version", "id", "run_id", "action", "resource", "parameters", "parameter_hash"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "id": { "$ref": "#/$defs/uuidV7" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "action": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(?!\\s*$)[\\s\\S]+$" },
+        "resource": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^(?!\\s*$)[\\s\\S]+$" },
+        "parameters": { "$ref": "#/$defs/canonicalParameter", "description": "Canonical binding depth <= 32 and compact encoded binding <= 65536 bytes." },
+        "parameter_hash": { "$ref": "#/$defs/sha256", "readOnly": true }
+      }
+    },
+    "policyEvaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "action_id", "parameter_hash", "decision", "effective_risk", "policy_version", "rule_id", "reason_code", "evaluated_at"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "action_id": { "$ref": "#/$defs/uuidV7" },
+        "parameter_hash": { "$ref": "#/$defs/sha256" },
+        "decision": { "enum": ["allow", "deny", "require_approval"] },
+        "effective_risk": { "enum": ["L0", "L1", "L2", "L3", "L4"] },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "rule_id": { "type": "string", "minLength": 1 },
+        "reason_code": { "type": "string", "minLength": 1 },
+        "evaluated_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "approvalRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pending" } }, "required": ["status"] },
+          "then": { "properties": { "decision": { "type": "null" }, "consumed_at": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "approved" } }, "required": ["status"] },
+          "then": { "properties": { "decision": { "$ref": "#/$defs/approvedDecision" }, "consumed_at": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "denied" } }, "required": ["status"] },
+          "then": { "properties": { "decision": { "$ref": "#/$defs/deniedDecision" }, "consumed_at": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "consumed" } }, "required": ["status"] },
+          "then": { "properties": { "decision": { "$ref": "#/$defs/approvedDecision" }, "consumed_at": { "$ref": "#/$defs/timestamp" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "expired" } }, "required": ["status"] },
+          "then": { "properties": { "consumed_at": { "type": "null" } } }
+        }
+      ],
+      "required": ["schema_version", "id", "run_id", "action_id", "parameter_hash", "requested_by", "request_reason", "created_at", "expires_at", "status", "revision", "decision", "consumed_at"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "id": { "$ref": "#/$defs/uuidV7" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "action_id": { "$ref": "#/$defs/uuidV7" },
+        "parameter_hash": { "$ref": "#/$defs/sha256" },
+        "requested_by": { "$ref": "#/$defs/actorId" },
+        "request_reason": { "type": "string", "minLength": 1 },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "status": { "enum": ["pending", "approved", "denied", "expired", "consumed"] },
+        "revision": { "type": "integer", "minimum": 0 },
+        "decision": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["decision", "actor", "reason", "decided_at"],
+              "properties": {
+                "decision": { "enum": ["approved", "denied"] },
+                "actor": { "$ref": "#/$defs/actorId" },
+                "reason": { "type": ["string", "null"] },
+                "decided_at": { "$ref": "#/$defs/timestamp" }
+              }
+            }
+          ]
+        },
+        "consumed_at": { "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "approvedDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "actor", "reason", "decided_at"],
+      "properties": {
+        "decision": { "const": "approved" },
+        "actor": { "$ref": "#/$defs/actorId" },
+        "reason": { "type": ["string", "null"] },
+        "decided_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "deniedDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "actor", "reason", "decided_at"],
+      "properties": {
+        "decision": { "const": "denied" },
+        "actor": { "$ref": "#/$defs/actorId" },
+        "reason": { "type": ["string", "null"] },
+        "decided_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "runtimeTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "runtime", "prompt", "prompt_hash", "working_directory", "timeout_seconds", "capabilities"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "runtime": { "type": "string", "minLength": 1 },
+        "prompt": { "type": "string" },
+        "prompt_hash": { "$ref": "#/$defs/sha256" },
+        "working_directory": { "type": "string", "pattern": "^/workspace(?:/[^/]+)*$" },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "capabilities": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 128 } }
+      }
+    },
+    "runtimeEventPayload": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "started" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "chunk", "truncated"], "properties": { "kind": { "enum": ["stdout", "stderr"] }, "chunk": { "type": "string" }, "truncated": { "type": "boolean" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "content"], "properties": { "kind": { "const": "message" }, "content": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "name", "parameters"], "properties": { "kind": { "const": "tool_call" }, "name": { "type": "string", "minLength": 1 }, "parameters": {} } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "relative_path"], "properties": { "kind": { "const": "artifact" }, "relative_path": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "exit_code"], "properties": { "kind": { "const": "completed" }, "exit_code": { "type": "integer" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "code", "message"], "properties": { "kind": { "const": "failed" }, "code": { "type": "string" }, "message": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "cancelled" } } }
+      ]
+    },
+    "runtimeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "sequence", "timestamp", "payload", "vendor_metadata"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schemaVersion" },
+        "run_id": { "$ref": "#/$defs/uuidV7" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/runtimeEventPayload" },
+        "vendor_metadata": { "type": "object" }
+      }
+    }
+  }
+}

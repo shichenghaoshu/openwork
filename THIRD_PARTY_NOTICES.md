@@ -22,12 +22,15 @@ components remain disabled until their integration issue passes tests and licens
 | serde            | 1.0.229            | MIT OR Apache-2.0                    | Rust data model serialization.                                                          |
 | sysinfo          | 0.39.6             | MIT                                 | Read-only host memory and OS facts.                                                     |
 | fs2              | 0.4.3              | MIT OR Apache-2.0                    | Read-only filesystem capacity facts.                                                   |
+| jsonschema       | 0.49.9             | MIT                                 | Test-only Draft 2020-12 validation of checked-in execution contracts.                  |
 | serde_json       | 1.0.151            | MIT OR Apache-2.0                    | Development-time JSON diagnostic assertions.                                           |
 | clap             | 4.6.6              | MIT OR Apache-2.0                    | Rust command-line parsing and help output.                                              |
 | tempfile         | 3.27.0             | MIT OR Apache-2.0                    | Development-only dry-run side-effect tests.                                             |
 | atomicwrites     | 0.4.4              | MIT                                 | Cross-platform atomic replacement of OpenWork-managed state files.                      |
 | reqwest          | 0.13.4             | MIT OR Apache-2.0                    | HTTPS client for verified, allowlisted runtime downloads.                               |
 | sha2             | 0.11.0             | MIT OR Apache-2.0                    | Streaming SHA-256 verification for downloaded runtime artifacts.                        |
+| time             | 0.3.55             | MIT OR Apache-2.0                    | RFC 3339 UTC timestamp validation for execution records.                                |
+| uuid             | 1.24.0             | MIT OR Apache-2.0                    | UUIDv7 generation and validation for sortable execution identifiers.                    |
 
 Exact repositories, commits, image digests, and evidence links are in
 [the upstream matrix](docs/upstream-matrix.md), [the version lock](installer/versions.lock.yaml),

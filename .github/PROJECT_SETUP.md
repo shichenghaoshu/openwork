@@ -1,7 +1,8 @@
 # GitHub project setup
 
 The repository, labels, milestones, and canonical Issues #1–#30 were created on
-2026-08-10. GitHub Project creation is pending because the current CLI token lacks
+2026-08-10. The M1 milestone additionally tracks Issues #3, #6, #12–#15, and
+#63–#65. GitHub Project creation is pending because the current CLI token lacks
 `project` and `read:project` scopes.
 
 ```bash
