@@ -7,7 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openwork-core = { path = "../openwork-core" }
 openwork-platform = { path = "../openwork-platform" }
+openwork-runtime = { path = "../openwork-runtime" }
 serde.workspace = true
 
 [lints]

@@ -26,6 +26,8 @@ components remain disabled until their integration issue passes tests and licens
 | clap             | 4.6.6              | MIT OR Apache-2.0                    | Rust command-line parsing and help output.                                              |
 | tempfile         | 3.27.0             | MIT OR Apache-2.0                    | Development-only dry-run side-effect tests.                                             |
 | atomicwrites     | 0.4.4              | MIT                                 | Cross-platform atomic replacement of OpenWork-managed state files.                      |
+| reqwest          | 0.13.4             | MIT OR Apache-2.0                    | HTTPS client for verified, allowlisted runtime downloads.                               |
+| sha2             | 0.11.0             | MIT OR Apache-2.0                    | Streaming SHA-256 verification for downloaded runtime artifacts.                        |
 
 Exact repositories, commits, image digests, and evidence links are in
 [the upstream matrix](docs/upstream-matrix.md), [the version lock](installer/versions.lock.yaml),

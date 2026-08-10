@@ -5,6 +5,7 @@ mod codex;
 mod manifest;
 mod mock;
 mod registry;
+mod system_downloader;
 
 pub mod compatibility;
 
@@ -16,6 +17,7 @@ pub use manifest::{
 };
 pub use mock::MockRuntime;
 pub use registry::RuntimeRegistry;
+pub use system_downloader::{DownloadPolicy, SystemDownloader};
 
 use openwork_core::OpenWorkError;
 use serde::{Deserialize, Serialize};

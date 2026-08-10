@@ -42,6 +42,31 @@ fn install_dry_run_has_no_filesystem_side_effects() {
 }
 
 #[test]
+fn runtime_install_preview_uses_the_managed_plan_without_side_effects() {
+    let home = tempfile::tempdir().unwrap();
+    let output = openwork()
+        .args(["install", "--dry-run", "--runtime", "claude", "--json"])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert!(value["steps"].as_array().is_some_and(|steps| {
+        steps
+            .iter()
+            .any(|step| step["id"] == "runtime.claude-code.download.0")
+    }));
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn execute_requires_explicit_consent() {
+    let output = openwork().args(["install", "--execute"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
 fn runtime_commands_expose_registered_and_error_states() {
     let list = openwork()
         .args(["runtime", "list", "--json"])

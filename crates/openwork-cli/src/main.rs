@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand};
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
-use openwork_installer::{InstallPlan, dry_run_plan};
+use openwork_installer::{
+    ExecutionMode, InstallExecutionReport, InstallExecutor, InstallPlan, dry_run_plan,
+    managed_runtime_plan,
+};
 use openwork_platform::{PlatformInfo, PlatformProbe, SystemPlatformProbe, detect};
 use openwork_runtime::{
-    AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, RuntimeCapabilities, RuntimeDetection,
-    RuntimeId, RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
+    AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, DetectionState, RuntimeCapabilities,
+    RuntimeDetection, RuntimeId, RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
+    SystemDownloader,
 };
 use serde::Serialize;
 use std::process::ExitCode;
@@ -26,8 +30,20 @@ struct Cli {
 enum Command {
     /// Preview a Bootstrap installation without changing the host.
     Install {
-        #[arg(long, required = true)]
+        #[arg(long, conflicts_with = "execute", required_unless_present = "execute")]
         dry_run: bool,
+        /// Apply the reviewed plan. Requires an explicit consent flag.
+        #[arg(long, conflicts_with = "dry_run", requires = "yes")]
+        execute: bool,
+        /// Confirm that the selected plan may modify managed `OpenWork` paths.
+        #[arg(long, requires = "execute")]
+        yes: bool,
+        /// Include one external-managed runtime in the plan.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Advisory upstream version or channel, when the adapter supports it.
+        #[arg(long, requires = "runtime")]
+        version: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -80,6 +96,13 @@ struct RuntimeSummary {
     capabilities: RuntimeCapabilities,
 }
 
+struct InstallRequest {
+    execute: bool,
+    runtime: Option<String>,
+    version: Option<String>,
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
     if arguments.len() == 2 && matches!(arguments[1].as_str(), "--version" | "-V") {
@@ -116,11 +139,22 @@ fn run(cli: Cli, probe: &impl PlatformProbe) -> ExitCode {
 
 fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, bool)> {
     match cli.command {
-        Command::Install { dry_run: _, json } => {
-            let host = platform(probe, json)?;
-            render_install(&dry_run_plan(&host), json);
-            Ok(0)
-        }
+        Command::Install {
+            dry_run: _,
+            execute,
+            yes: _,
+            runtime,
+            version,
+            json,
+        } => execute_install(
+            probe,
+            InstallRequest {
+                execute,
+                runtime,
+                version,
+                json,
+            },
+        ),
         Command::Status { json } => {
             let host = platform(probe, json)?;
             let runtimes = runtime_summaries(&runtime_registry(&host), json)?;
@@ -203,6 +237,102 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
     }
 }
 
+fn execute_install(
+    probe: &impl PlatformProbe,
+    request: InstallRequest,
+) -> Result<u8, (OpenWorkError, bool)> {
+    let host = platform(probe, request.json)?;
+    let registry = runtime_registry(&host);
+    let (plan, selected_runtime) = if let Some(requested_id) = request.runtime {
+        let normalized_id = normalize_runtime_id(&requested_id);
+        let runtime = registry
+            .get(&RuntimeId::from(normalized_id))
+            .ok_or_else(|| {
+                (
+                    OpenWorkError::new(
+                        ErrorCode::RuntimeNotFound,
+                        format!("runtime `{requested_id}` is not registered"),
+                    )
+                    .with_remediation("Run `openwork runtime list` to see available runtimes."),
+                    request.json,
+                )
+            })?;
+        let runtime_plan = runtime
+            .install_plan(request.version.as_deref())
+            .map_err(|error| (error, request.json))?;
+        (
+            managed_runtime_plan(&host, normalized_id, &runtime_plan),
+            Some(runtime),
+        )
+    } else {
+        (dry_run_plan(&host), None)
+    };
+
+    if !request.execute {
+        render_install(&plan, request.json);
+        return Ok(0);
+    }
+    ensure_runtime_is_missing(selected_runtime.as_deref(), request.json)?;
+
+    let downloader = SystemDownloader::new().map_err(|error| (error, request.json))?;
+    let runner = SystemCommandRunner;
+    match InstallExecutor::new(&downloader, &runner).run(
+        &plan,
+        ExecutionMode::Execute,
+        &openwork_runtime::CancellationToken::new(),
+    ) {
+        Ok(report) => {
+            render_install_execution(&report, request.json);
+            Ok(0)
+        }
+        Err(failure) => {
+            render_install_failure(&failure, request.json);
+            Ok(failure.error.exit_code())
+        }
+    }
+}
+
+fn ensure_runtime_is_missing(
+    runtime: Option<&dyn AgentRuntime>,
+    json: bool,
+) -> Result<(), (OpenWorkError, bool)> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let detection = runtime.detect().map_err(|error| (error, json))?;
+    if detection.state == DetectionState::Missing {
+        return Ok(());
+    }
+    Err((
+        OpenWorkError::new(
+            ErrorCode::InstallFailed,
+            format!(
+                "refusing to modify the existing `{}` runtime installation",
+                runtime.metadata().id
+            ),
+        )
+        .with_remediation(
+            "Preserve the existing installation and use its official updater explicitly.",
+        ),
+        json,
+    ))
+}
+
+fn render_install_failure(failure: &openwork_installer::InstallExecutionFailure, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(failure).unwrap_or_default()
+        );
+        return;
+    }
+    eprintln!("error[{:?}]: {}", failure.error.code, failure.error);
+    eprintln!("partial state: {}", failure.report.partial_state);
+    for warning in &failure.report.rollback_warnings {
+        eprintln!("rollback warning: {warning}");
+    }
+}
+
 fn runtime_registry(host: &PlatformInfo) -> RuntimeRegistry {
     let mut registry = RuntimeRegistry::new();
     registry
@@ -220,6 +350,10 @@ fn runtime_registry(host: &PlatformInfo) -> RuntimeRegistry {
         )))
         .expect("built-in runtime ids are unique");
     registry
+}
+
+fn normalize_runtime_id(id: &str) -> &str {
+    if id == "claude" { "claude-code" } else { id }
 }
 
 fn runtime_summaries(
@@ -270,6 +404,20 @@ fn render_install(plan: &InstallPlan, json: bool) {
     }
     for warning in &plan.warnings {
         println!("warning: {warning}");
+    }
+}
+
+fn render_install_execution(report: &InstallExecutionReport, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_default()
+        );
+        return;
+    }
+    println!("OpenWork installation completed: {}", report.completed);
+    for step in &report.steps {
+        println!("- {} [{:?}]: {}", step.id, step.status, step.detail);
     }
 }
 
