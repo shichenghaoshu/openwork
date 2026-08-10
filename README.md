@@ -8,8 +8,9 @@ business tools, and safe execution.
 [中文](README.zh-CN.md) · [Getting started](docs/getting-started.md) ·
 [Deploy for a client](docs/deploy-for-client.md) · [Build a pack](docs/packs/build-your-first-pack.md)
 
-> Status: `v0.1-bootstrap`. The native Rust CLI supports version, structured
-> doctor/status output, runtime discovery commands, and non-mutating install plans.
+> Status: `v0.1.0-alpha.1` Bootstrap Runtime Milestone. The native Rust CLI
+> supports version, structured doctor/status output, runtime discovery, and
+> consent-gated install planning and execution.
 
 ## What employees will be able to do
 
@@ -45,7 +46,9 @@ checksum-verifying [POSIX](scripts/install.sh) and [PowerShell](scripts/install.
 scripts. Existing binaries are refused
 unless an explicit force option creates a backup first. See the
 [release checklist](docs/release/checklist.md) and reproducible
-[Bootstrap demo](docs/demo/bootstrap-runtime.md).
+[Bootstrap demo](docs/demo/bootstrap-runtime.md). See the
+[alpha release notes](docs/release/v0.1.0-alpha.1.md) for delivered scope and
+known limitations.
 
 See the [platform evidence matrix](docs/platform-support.md) for the difference
 between fixtures, CI smoke tests, and real-host validation.
