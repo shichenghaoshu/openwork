@@ -104,7 +104,7 @@
       "additionalProperties": false,
       "required": ["program", "arguments", "environment"],
       "properties": {
-        "program": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/[^\\u0000]*$" },
+        "program": { "type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^/(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*[/]$)(?!.*[/]\\.{1,2}(?:/|$))[^\\u0000]*$" },
         "arguments": { "type": "array", "items": { "type": "string", "maxLength": 8192, "pattern": "^[^\\u0000]*$" }, "maxItems": 256 },
         "environment": {
           "type": "object",

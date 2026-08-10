@@ -623,7 +623,7 @@ impl<'de> Deserialize<'de> for DigestPinnedImageRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCommand {
-    program: PathBuf,
+    program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
 }
@@ -631,13 +631,18 @@ pub struct SandboxCommand {
 impl SandboxCommand {
     #[allow(clippy::missing_errors_doc)]
     pub fn new(
-        program: PathBuf,
+        program: impl Into<String>,
         arguments: Vec<String>,
         environment: BTreeMap<String, String>,
     ) -> Result<Self, OpenWorkError> {
-        let program_text = program
-            .to_str()
-            .ok_or_else(|| invalid_contract("sandbox program must be UTF-8"))?;
+        let program = program.into();
+        let valid_program = program.starts_with('/')
+            && !program.starts_with("//")
+            && !program.ends_with('/')
+            && !program.contains('\0')
+            && !program
+                .split('/')
+                .any(|segment| segment == "." || segment == "..");
         let arguments_valid = arguments.len() <= 256
             && arguments
                 .iter()
@@ -646,12 +651,7 @@ impl SandboxCommand {
             && environment.iter().all(|(key, value)| {
                 valid_environment_name(key) && value.len() <= 8192 && !value.contains('\0')
             });
-        if !program.is_absolute()
-            || program_text.contains('\0')
-            || program_text.starts_with('-')
-            || !arguments_valid
-            || !environment_valid
-        {
+        if !valid_program || !arguments_valid || !environment_valid {
             return Err(invalid_contract(
                 "sandbox command must use an absolute program and bounded argv/environment allowlist",
             ));
@@ -664,7 +664,7 @@ impl SandboxCommand {
     }
 
     #[must_use]
-    pub fn program(&self) -> &Path {
+    pub fn program(&self) -> &str {
         &self.program
     }
 
@@ -682,7 +682,7 @@ impl SandboxCommand {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SandboxCommandWire {
-    program: PathBuf,
+    program: String,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
 }
@@ -1850,7 +1850,7 @@ mod tests {
             ))
             .expect("pinned image"),
             SandboxCommand::new(
-                PathBuf::from("/usr/bin/mock-runtime"),
+                "/usr/bin/mock-runtime",
                 vec!["run".to_owned()],
                 BTreeMap::from([("LANG".to_owned(), "C.UTF-8".to_owned())]),
             )
