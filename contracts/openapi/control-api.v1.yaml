@@ -1,0 +1,225 @@
+openapi: 3.1.0
+info:
+  title: OpenWork Control API
+  version: 0.1.0
+  description: M1 single-installation control plane. All /v1 routes require Bearer authentication.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /health:
+    get:
+      summary: Check Control API and Postgres health
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: API and Postgres are healthy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: Postgres is unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /v1/runs:
+    post:
+      summary: Create a safe execution run
+      operationId: createRun
+      description: >-
+        Fail-closed until the execution orchestrator can atomically persist the run.created
+        genesis audit event. Actor identity always comes from the Bearer authentication context.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRun" }
+      responses:
+        "503": { $ref: "#/components/responses/OrchestratorUnavailable" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Invalid" }
+  /v1/runs/{run_id}:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+    get:
+      summary: Get one run
+      operationId: getRun
+      responses:
+        "200":
+          description: Run state
+          content:
+            application/json:
+              schema: { $ref: "../schemas/safe-execution.v1.schema.json#/$defs/run" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/runs/{run_id}/cancel:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+    post:
+      summary: Cancel one run
+      operationId: cancelRun
+      description: Fail-closed until runtime and sandbox cancellation are injected.
+      responses:
+        "503": { $ref: "#/components/responses/OrchestratorUnavailable" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/runs/{run_id}/events:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+    get:
+      summary: List ordered audit events
+      operationId: listRunEvents
+      responses:
+        "200":
+          description: Ordered redacted audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "../schemas/safe-execution.v1.schema.json#/$defs/auditEvent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/runs/{run_id}/artifacts:
+    parameters:
+      - { $ref: "#/components/parameters/RunId" }
+    get:
+      summary: List artifact metadata
+      operationId: listRunArtifacts
+      responses:
+        "200":
+          description: Artifact metadata; content is never included
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "../schemas/safe-execution.v1.schema.json#/$defs/artifact" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/approvals:
+    get:
+      summary: List approval requests
+      operationId: listApprovals
+      responses:
+        "200":
+          description: Approval requests
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "../schemas/safe-execution.v1.schema.json#/$defs/approvalRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/approvals/{approval_id}/approve:
+    parameters:
+      - { $ref: "#/components/parameters/ApprovalId" }
+    post:
+      summary: Approve an exact action request
+      operationId: approveAction
+      description: Fail-closed until decision and audit persistence share one transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Decision" }
+      responses:
+        "503": { $ref: "#/components/responses/ApprovalUnavailable" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Invalid" }
+  /v1/approvals/{approval_id}/deny:
+    parameters:
+      - { $ref: "#/components/parameters/ApprovalId" }
+    post:
+      summary: Deny an exact action request
+      operationId: denyAction
+      description: Fail-closed until decision and audit persistence share one transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Decision" }
+      responses:
+        "503": { $ref: "#/components/responses/ApprovalUnavailable" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Invalid" }
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, postgres]
+      properties:
+        status: { enum: [ok, degraded] }
+        postgres: { enum: [ok, unavailable] }
+    CreateRun:
+      type: object
+      additionalProperties: false
+      required: [runtime, workspace, prompt]
+      properties:
+        runtime: { type: string, minLength: 1, maxLength: 128 }
+        workspace:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._/-]+$"
+        prompt: { type: string, minLength: 1, maxLength: 262144 }
+    Decision:
+      type: object
+      additionalProperties: false
+      required: [expected_revision]
+      properties:
+        expected_revision: { type: integer, minimum: 0 }
+        reason: { type: [string, "null"], maxLength: 2048 }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string }
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+  responses:
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Invalid:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    OrchestratorUnavailable:
+      description: Execution orchestrator not connected; no state was changed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ApprovalUnavailable:
+      description: Approval service not connected; no state was changed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
