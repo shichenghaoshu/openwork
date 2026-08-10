@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openwork.dev/schemas/runtime-lockfile.v1.schema.json",
+  "title": "OpenWork Runtime Lockfile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "generatedAt", "runtimes"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "generatedAt": { "type": "string", "minLength": 1 },
+    "runtimes": {
+      "type": "object",
+      "propertyNames": { "minLength": 1 },
+      "additionalProperties": { "$ref": "#/$defs/runtime" }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "nullableString": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonEmptyString" },
+        { "type": "null" }
+      ]
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested",
+        "resolved",
+        "source",
+        "checksum",
+        "installedPath",
+        "timestamps",
+        "status",
+        "upstream",
+        "license"
+      ],
+      "properties": {
+        "requested": { "$ref": "#/$defs/requested" },
+        "resolved": { "$ref": "#/$defs/resolved" },
+        "source": { "$ref": "#/$defs/source" },
+        "checksum": { "$ref": "#/$defs/checksum" },
+        "installedPath": { "$ref": "#/$defs/nonEmptyString" },
+        "timestamps": { "$ref": "#/$defs/timestamps" },
+        "status": { "enum": ["pending", "installed", "failed", "removed"] },
+        "upstream": { "$ref": "#/$defs/upstream" },
+        "license": { "$ref": "#/$defs/license" }
+      }
+    },
+    "requested": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["constraint", "channel"],
+      "properties": {
+        "constraint": { "$ref": "#/$defs/nonEmptyString" },
+        "channel": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "resolved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "artifact"],
+      "properties": {
+        "version": { "$ref": "#/$defs/nonEmptyString" },
+        "artifact": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "uri", "reference"],
+      "properties": {
+        "kind": {
+          "enum": ["official-installer", "package-manager", "release-artifact", "system-path"]
+        },
+        "uri": { "$ref": "#/$defs/nonEmptyString" },
+        "reference": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest", "authority", "authorityUrl"],
+      "properties": {
+        "algorithm": { "$ref": "#/$defs/nonEmptyString" },
+        "digest": { "$ref": "#/$defs/nullableString" },
+        "authority": {
+          "enum": [
+            "upstream",
+            "installer-metadata",
+            "package-manager",
+            "observed",
+            "unavailable"
+          ]
+        },
+        "authorityUrl": { "$ref": "#/$defs/nullableString" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "authority": { "const": "unavailable" } },
+            "required": ["authority"]
+          },
+          "then": { "properties": { "digest": { "type": "null" } } },
+          "else": { "properties": { "digest": { "$ref": "#/$defs/nonEmptyString" } } }
+        }
+      ]
+    },
+    "timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["createdAt", "updatedAt", "verifiedAt"],
+      "properties": {
+        "createdAt": { "$ref": "#/$defs/nonEmptyString" },
+        "updatedAt": { "$ref": "#/$defs/nonEmptyString" },
+        "verifiedAt": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectUrl", "releaseUrl", "revision"],
+      "properties": {
+        "projectUrl": { "$ref": "#/$defs/nonEmptyString" },
+        "releaseUrl": { "$ref": "#/$defs/nullableString" },
+        "revision": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx", "url"],
+      "properties": {
+        "spdx": { "$ref": "#/$defs/nonEmptyString" },
+        "url": { "$ref": "#/$defs/nullableString" }
+      }
+    }
+  }
+}

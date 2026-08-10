@@ -25,6 +25,7 @@ components remain disabled until their integration issue passes tests and licens
 | serde_json       | 1.0.151            | MIT OR Apache-2.0                    | Development-time JSON diagnostic assertions.                                           |
 | clap             | 4.6.6              | MIT OR Apache-2.0                    | Rust command-line parsing and help output.                                              |
 | tempfile         | 3.27.0             | MIT OR Apache-2.0                    | Development-only dry-run side-effect tests.                                             |
+| atomicwrites     | 0.4.4              | MIT                                 | Cross-platform atomic replacement of OpenWork-managed state files.                      |
 
 Exact repositories, commits, image digests, and evidence links are in
 [the upstream matrix](docs/upstream-matrix.md), [the version lock](installer/versions.lock.yaml),
