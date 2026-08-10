@@ -1,19 +1,25 @@
 use clap::{Parser, Subcommand};
+use openwork_config::{
+    ChecksumAuthority, LockfileError, LockfileStore, RequestedRuntime, ResolvedRuntime,
+    RuntimeChecksum, RuntimeInstallStatus, RuntimeLicense, RuntimeLockEntry, RuntimeLockfile,
+    RuntimeSource, RuntimeSourceKind, RuntimeTimestamps, StoragePaths, UpstreamProvenance,
+};
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
 use openwork_installer::{
-    ExecutionMode, InstallExecutionReport, InstallExecutor, InstallPlan, dry_run_plan,
-    managed_runtime_plan,
+    ExecutionMode, InstallExecutionFailure, InstallExecutionReport, InstallExecutor, InstallPlan,
+    StepResult, StepStatus, dry_run_plan, managed_runtime_plan,
 };
 use openwork_platform::{PlatformInfo, PlatformProbe, SystemPlatformProbe, detect};
 use openwork_runtime::{
     AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, DetectionState, RuntimeCapabilities,
-    RuntimeDetection, RuntimeId, RuntimeMetadata, RuntimeRegistry, SystemCommandRunner,
-    SystemDownloader,
+    RuntimeDetection, RuntimeId, RuntimeInstallPlan, RuntimeMetadata, RuntimeRegistry,
+    SystemCommandRunner, SystemDownloader,
 };
 use serde::Serialize;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -85,6 +91,8 @@ struct StatusReport {
     state: &'static str,
     platform: PlatformInfo,
     runtimes: Vec<RuntimeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lockfile: Option<RuntimeLockfile>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +109,12 @@ struct InstallRequest {
     runtime: Option<String>,
     version: Option<String>,
     json: bool,
+}
+
+struct PreparedRuntime {
+    runtime: Arc<dyn AgentRuntime>,
+    install_plan: RuntimeInstallPlan,
+    requested: String,
 }
 
 fn main() -> ExitCode {
@@ -155,18 +169,7 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
                 json,
             },
         ),
-        Command::Status { json } => {
-            let host = platform(probe, json)?;
-            let runtimes = runtime_summaries(&runtime_registry(&host), json)?;
-            let report = StatusReport {
-                schema_version: 1,
-                state: "not_installed",
-                platform: host,
-                runtimes,
-            };
-            render_status(&report, json);
-            Ok(0)
-        }
+        Command::Status { json } => execute_status(probe, json),
         Command::Doctor { json } => {
             let report = inspect_platform(&platform(probe, json)?);
             render_doctor(&report, json);
@@ -237,13 +240,32 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
     }
 }
 
+fn execute_status(probe: &impl PlatformProbe, json: bool) -> Result<u8, (OpenWorkError, bool)> {
+    let host = platform(probe, json)?;
+    let runtimes = runtime_summaries(&runtime_registry(&host), json)?;
+    let lockfile = read_runtime_lockfile(&host).map_err(|error| (error, json))?;
+    let report = StatusReport {
+        schema_version: 1,
+        state: if lockfile.is_some() {
+            "installed"
+        } else {
+            "not_installed"
+        },
+        platform: host,
+        runtimes,
+        lockfile,
+    };
+    render_status(&report, json);
+    Ok(0)
+}
+
 fn execute_install(
     probe: &impl PlatformProbe,
     request: InstallRequest,
 ) -> Result<u8, (OpenWorkError, bool)> {
     let host = platform(probe, request.json)?;
     let registry = runtime_registry(&host);
-    let (plan, selected_runtime) = if let Some(requested_id) = request.runtime {
+    let prepared_runtime = if let Some(requested_id) = request.runtime {
         let normalized_id = normalize_runtime_id(&requested_id);
         let runtime = registry
             .get(&RuntimeId::from(normalized_id))
@@ -260,19 +282,35 @@ fn execute_install(
         let runtime_plan = runtime
             .install_plan(request.version.as_deref())
             .map_err(|error| (error, request.json))?;
-        (
-            managed_runtime_plan(&host, normalized_id, &runtime_plan),
-            Some(runtime),
-        )
+        Some(PreparedRuntime {
+            runtime,
+            requested: request.version.unwrap_or_else(|| "latest".to_owned()),
+            install_plan: runtime_plan,
+        })
     } else {
-        (dry_run_plan(&host), None)
+        None
     };
+    let plan = prepared_runtime.as_ref().map_or_else(
+        || dry_run_plan(&host),
+        |prepared| {
+            managed_runtime_plan(
+                &host,
+                prepared.runtime.metadata().id.0.as_str(),
+                &prepared.install_plan,
+            )
+        },
+    );
 
     if !request.execute {
         render_install(&plan, request.json);
         return Ok(0);
     }
-    ensure_runtime_is_missing(selected_runtime.as_deref(), request.json)?;
+    ensure_runtime_is_missing(
+        prepared_runtime
+            .as_ref()
+            .map(|prepared| prepared.runtime.as_ref()),
+        request.json,
+    )?;
 
     let downloader = SystemDownloader::new().map_err(|error| (error, request.json))?;
     let runner = SystemCommandRunner;
@@ -281,10 +319,25 @@ fn execute_install(
         ExecutionMode::Execute,
         &openwork_runtime::CancellationToken::new(),
     ) {
-        Ok(report) => {
-            render_install_execution(&report, request.json);
-            Ok(0)
-        }
+        Ok(mut report) => match persist_install_state(&host, prepared_runtime.as_ref(), &report) {
+            Ok(()) => {
+                render_install_execution(&report, request.json);
+                Ok(0)
+            }
+            Err(error) => {
+                report.completed = false;
+                report.partial_state = true;
+                report.steps.push(StepResult {
+                    id: "state.runtime-lockfile".to_owned(),
+                    status: StepStatus::Failed,
+                    detail: error.message.clone(),
+                    download_receipt: None,
+                });
+                let failure = InstallExecutionFailure { error, report };
+                render_install_failure(&failure, request.json);
+                Ok(failure.error.exit_code())
+            }
+        },
         Err(failure) => {
             render_install_failure(&failure, request.json);
             Ok(failure.error.exit_code())
@@ -316,6 +369,177 @@ fn ensure_runtime_is_missing(
         ),
         json,
     ))
+}
+
+fn read_runtime_lockfile(host: &PlatformInfo) -> Result<Option<RuntimeLockfile>, OpenWorkError> {
+    let path = runtime_lockfile_path(host);
+    if !path.exists() {
+        return Ok(None);
+    }
+    LockfileStore::new(path)
+        .read()
+        .map(Some)
+        .map_err(|error| lockfile_error(&error))
+}
+
+fn persist_install_state(
+    host: &PlatformInfo,
+    prepared: Option<&PreparedRuntime>,
+    report: &InstallExecutionReport,
+) -> Result<(), OpenWorkError> {
+    let lockfile_path = runtime_lockfile_path(host);
+    StoragePaths::new(
+        host.paths.config.join("config.json"),
+        lockfile_path.clone(),
+        host.paths.data.join("secrets.json"),
+    )
+    .validate()
+    .map_err(|error| lockfile_error(&error))?;
+
+    let timestamp = current_timestamp();
+    let runtime_entry = prepared
+        .map(|prepared| resolved_runtime_entry(host, prepared, report, &timestamp))
+        .transpose()?;
+    let unhealthy = runtime_entry
+        .as_ref()
+        .is_some_and(|(_, entry)| entry.status != RuntimeInstallStatus::Installed);
+    LockfileStore::new(lockfile_path)
+        .update_or_create(RuntimeLockfile::empty(&timestamp), |lockfile| {
+            lockfile.generated_at.clone_from(&timestamp);
+            if let Some((runtime_id, entry)) = &runtime_entry {
+                lockfile.runtimes.insert(runtime_id.clone(), entry.clone());
+            }
+            Ok(())
+        })
+        .map_err(|error| lockfile_error(&error))?;
+
+    if unhealthy {
+        return Err(OpenWorkError::new(
+            ErrorCode::RuntimeUnhealthy,
+            "the official installer exited successfully but the runtime did not become healthy",
+        )
+        .with_remediation(
+            "The failed state was recorded; run `openwork runtime info <id>` and `openwork doctor` before retrying.",
+        ));
+    }
+    Ok(())
+}
+
+fn resolved_runtime_entry(
+    host: &PlatformInfo,
+    prepared: &PreparedRuntime,
+    report: &InstallExecutionReport,
+    timestamp: &str,
+) -> Result<(String, RuntimeLockEntry), OpenWorkError> {
+    let metadata = prepared.runtime.metadata();
+    let detection = prepared.runtime.detect()?;
+    let healthy = detection.state == DetectionState::Healthy;
+    let version = prepared
+        .runtime
+        .version()?
+        .unwrap_or_else(|| "unknown".to_owned());
+    let receipt = report
+        .steps
+        .iter()
+        .find_map(|step| step.download_receipt.as_ref());
+    let expected_digest = prepared
+        .install_plan
+        .downloads
+        .first()
+        .and_then(|download| download.expected_sha256.as_ref());
+    let checksum = receipt.map_or(
+        RuntimeChecksum {
+            algorithm: "sha256".to_owned(),
+            digest: None,
+            authority: ChecksumAuthority::Unavailable,
+            authority_url: None,
+        },
+        |receipt| RuntimeChecksum {
+            algorithm: "sha256".to_owned(),
+            digest: Some(receipt.observed_sha256.clone()),
+            authority: if expected_digest.is_some() {
+                ChecksumAuthority::Upstream
+            } else {
+                ChecksumAuthority::Observed
+            },
+            authority_url: expected_digest.map(|_| prepared.install_plan.source_url.clone()),
+        },
+    );
+    let installed_path = detection.executable.unwrap_or_else(|| {
+        host.paths
+            .data
+            .join("runtimes")
+            .join(metadata.id.0.as_str())
+    });
+    let artifact = prepared
+        .install_plan
+        .downloads
+        .first()
+        .and_then(|download| download.destination.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let license = if metadata.license.contains("commercial") {
+        "LicenseRef-Anthropic-Commercial".to_owned()
+    } else {
+        metadata.license.clone()
+    };
+
+    Ok((
+        metadata.id.0,
+        RuntimeLockEntry {
+            requested: RequestedRuntime {
+                constraint: prepared.requested.clone(),
+                channel: None,
+            },
+            resolved: ResolvedRuntime { version, artifact },
+            source: RuntimeSource {
+                kind: RuntimeSourceKind::OfficialInstaller,
+                uri: prepared.install_plan.source_url.clone(),
+                reference: prepared.install_plan.version.clone(),
+            },
+            checksum,
+            installed_path,
+            timestamps: RuntimeTimestamps {
+                created_at: timestamp.to_owned(),
+                updated_at: timestamp.to_owned(),
+                verified_at: healthy.then(|| timestamp.to_owned()),
+            },
+            status: if healthy {
+                RuntimeInstallStatus::Installed
+            } else {
+                RuntimeInstallStatus::Failed
+            },
+            upstream: UpstreamProvenance {
+                project_url: metadata.upstream,
+                release_url: None,
+                revision: prepared.install_plan.version.clone(),
+            },
+            license: RuntimeLicense {
+                spdx: license,
+                url: None,
+            },
+        },
+    ))
+}
+
+fn runtime_lockfile_path(host: &PlatformInfo) -> std::path::PathBuf {
+    host.paths.data.join("runtime.lock.json")
+}
+
+fn current_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    format!("unix:{seconds}")
+}
+
+fn lockfile_error(error: &LockfileError) -> OpenWorkError {
+    OpenWorkError::new(
+        ErrorCode::ConfigInvalid,
+        format!("runtime lockfile update failed: {error}"),
+    )
+    .with_remediation(
+        "Preserve the current state file, fix its permissions or schema, and rerun status.",
+    )
 }
 
 fn render_install_failure(failure: &openwork_installer::InstallExecutionFailure, json: bool) {

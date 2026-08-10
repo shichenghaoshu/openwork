@@ -66,6 +66,8 @@ pub struct StepResult {
     pub id: String,
     pub status: StepStatus,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_receipt: Option<openwork_runtime::DownloadReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +148,7 @@ impl<'a> InstallExecutor<'a> {
                         id: step.id.clone(),
                         status: StepStatus::Planned,
                         detail: step.reason.clone(),
+                        download_receipt: None,
                     })
                     .collect(),
                 rollback_warnings: Vec::new(),
@@ -187,6 +190,7 @@ impl<'a> InstallExecutor<'a> {
                         id: step.id.clone(),
                         status: StepStatus::Failed,
                         detail: error.message.clone(),
+                        download_receipt: None,
                     });
                     return Err(rollback_failure(
                         mode,
@@ -240,6 +244,7 @@ impl<'a> InstallExecutor<'a> {
                 "downloaded {} bytes; sha256={}; verified={}",
                 receipt.bytes_written, receipt.observed_sha256, receipt.verified
             ),
+            download_receipt: Some(receipt),
         })
     }
 
@@ -281,6 +286,7 @@ impl<'a> InstallExecutor<'a> {
             id: step.id.clone(),
             status: StepStatus::Executed,
             detail: "command completed successfully".to_owned(),
+            download_receipt: None,
         })
     }
 }
@@ -386,6 +392,7 @@ fn execute_directory(
             id: step.id.clone(),
             status: StepStatus::Preserved,
             detail: "existing directory preserved".to_owned(),
+            download_receipt: None,
         });
     }
     if step.path.exists() {
@@ -417,6 +424,7 @@ fn execute_directory(
         id: step.id.clone(),
         status: StepStatus::Created,
         detail: "directory created".to_owned(),
+        download_receipt: None,
     })
 }
 
@@ -450,6 +458,7 @@ fn rollback_failure(
                 id: format!("rollback.{}", path.display()),
                 status: StepStatus::RolledBack,
                 detail: "reversible install change removed".to_owned(),
+                download_receipt: None,
             }),
             Err(rollback_error) => rollback_warnings.push(format!(
                 "could not roll back `{}`: {}",

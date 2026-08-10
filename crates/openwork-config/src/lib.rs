@@ -353,6 +353,35 @@ impl LockfileStore {
         })
     }
 
+    /// Creates the document when absent or updates it under the same exclusive
+    /// lock. This avoids a check-then-create race in first-run installers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from reading, the update callback, validation, locking,
+    /// serialization, or atomic replacement.
+    pub fn update_or_create<F>(
+        &self,
+        initial: RuntimeLockfile,
+        update: F,
+    ) -> Result<RuntimeLockfile, LockfileError>
+    where
+        F: FnOnce(&mut RuntimeLockfile) -> Result<(), LockfileError>,
+    {
+        self.with_exclusive_lock(|| {
+            let mut lockfile = if self.path.exists() {
+                read_lockfile(&self.path)?
+            } else {
+                initial
+            };
+            update(&mut lockfile)?;
+            lockfile.validate()?;
+            let bytes = serde_json::to_vec_pretty(&lockfile)?;
+            atomic_replace(&self.path, &bytes)?;
+            Ok(lockfile)
+        })
+    }
+
     fn with_exclusive_lock<T>(
         &self,
         action: impl FnOnce() -> Result<T, LockfileError>,
@@ -579,6 +608,36 @@ mod tests {
         for digit in ['0', '1', '2', '3'] {
             assert!(result.generated_at.contains(digit));
         }
+    }
+
+    #[test]
+    fn concurrent_first_run_creation_has_no_lost_update() {
+        let directory = tempdir().expect("tempdir");
+        let store = LockfileStore::new(directory.path().join("runtime.lock.json"));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+
+        for digit in ['a', 'b'] {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .update_or_create(RuntimeLockfile::empty("initial"), |lockfile| {
+                        lockfile.generated_at.push(digit);
+                        Ok(())
+                    })
+                    .expect("serialized first-run update");
+            }));
+        }
+        barrier.wait();
+        for handle in threads {
+            handle.join().expect("first-run thread");
+        }
+
+        let result = store.read().expect("read result");
+        assert!(result.generated_at.contains('a'));
+        assert!(result.generated_at.contains('b'));
     }
 
     #[cfg(unix)]

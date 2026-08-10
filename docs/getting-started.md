@@ -22,6 +22,10 @@ Dry-run does not create directories, download files, or execute subprocesses.
 An actual managed-path change requires both `--execute` and `--yes`; review the
 dry-run output first. Existing Claude Code or Codex installations are preserved and
 must be updated with their official updater rather than silently overwritten.
+After a successful execution, `runtime.lock.json` is atomically written under the
+detected OpenWork data directory. `openwork status --json` validates and returns
+that secret-free provenance; an invalid lockfile is an error rather than an
+"installed" claim.
 
 Never put provider keys on a command line or in the runtime lockfile. See the
 [platform evidence matrix](platform-support.md) before treating CI as proof of a

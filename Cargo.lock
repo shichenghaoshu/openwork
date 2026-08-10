@@ -823,6 +823,7 @@ name = "openwork-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "openwork-config",
  "openwork-core",
  "openwork-doctor",
  "openwork-installer",
