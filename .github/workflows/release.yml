@@ -175,7 +175,12 @@ jobs:
           Set-Content -Path "staging\$asset\build-provenance.json" -Value $provenance -Encoding utf8
           Compress-Archive -Path "staging\$asset" -DestinationPath "dist\$asset.zip"
           $hash = (Get-FileHash "dist\$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path "dist\$asset.zip.sha256" -Value "$hash  $asset.zip" -Encoding ascii
+          $checksumPath = Join-Path (Get-Location) "dist\$asset.zip.sha256"
+          [IO.File]::WriteAllText(
+            $checksumPath,
+            "$hash  $asset.zip`n",
+            [Text.UTF8Encoding]::new($false)
+          )
       - name: Attest the archive provenance
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
@@ -222,6 +227,7 @@ jobs:
           (
             cd dist
             for checksum in *.sha256; do
+              sed -i 's/\r$//' "$checksum"
               sha256sum --check "$checksum"
             done
             cat -- *.sha256 > SHA256SUMS.unsorted

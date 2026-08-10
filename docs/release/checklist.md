@@ -22,6 +22,8 @@ after every package job succeeds.
 2. Wait for `.github/workflows/release.yml` to finish. Do not manually upload a
    partial platform set.
 3. Download `SHA256SUMS` and the desired archive, then verify the archive checksum.
+   The consolidated manifest uses LF line endings so both GNU `sha256sum` and
+   POSIX-oriented `shasum -a 256 -c` consumers can parse every platform entry.
 4. Confirm `openwork-<tag>-sbom.spdx.json` is present and its digest is listed in
    `SHA256SUMS`. It is generated from the tagged source tree with pinned Syft.
 5. Verify GitHub's build provenance attestation:

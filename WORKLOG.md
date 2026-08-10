@@ -79,3 +79,17 @@ This file is updated before each development session ends.
 - Prepared `docs/release/v0.1.0-alpha.1.md` and the final tag/release verification
   workflow. Release URL and immutable asset evidence are recorded after the tag
   workflow completes.
+- Merged the final documentation PR #61 after all 20 checks passed, protected
+  `main` with those 20 required checks and strict PR/linear-history rules, and
+  published the annotated `v0.1.0-alpha.1` tag from commit `4d8cbec`. The release
+  workflow tested and built all five native targets, attested every archive,
+  generated the SPDX SBOM, and published 13 assets at
+  https://github.com/shichenghaoshu/openwork/releases/tag/v0.1.0-alpha.1.
+- Independently downloaded every release asset. That check caught CRLF inherited
+  from the Windows checksum file inside the otherwise-valid consolidated
+  `SHA256SUMS`; GNU verification in CI had accepted it, while macOS `shasum -c`
+  did not. Normalized the published Windows checksum and manifest to LF,
+  regenerated `SHA256SUMS.sha256`, re-uploaded the three corrected assets, and
+  made the workflow emit LF on Windows plus defensively normalize all inputs.
+  A fresh portable checksum and GitHub attestation verification is required
+  before Issue #30 and the milestone are closed.
