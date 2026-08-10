@@ -32,6 +32,11 @@ services:
       OPENWORK_API_ACTOR: ${OPENWORK_API_ACTOR:-control-admin}
       OPENWORK_CONTROL_BIND: 0.0.0.0:8080
     ports: ["127.0.0.1:${OPENWORK_CONTROL_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/openwork-control-api", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     networks: [control]
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
@@ -45,7 +50,7 @@ services:
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
     ports: ["127.0.0.1:${OPENWORK_LITELLM_PORT:-4000}:4000"]
-    networks: [control]
+    networks: [control, gateway-egress]
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
     cap_drop: [ALL]
@@ -53,7 +58,8 @@ services:
 
 networks:
   control:
-    internal: false
+    internal: true
+  gateway-egress:
 
 volumes:
   postgres-data:
