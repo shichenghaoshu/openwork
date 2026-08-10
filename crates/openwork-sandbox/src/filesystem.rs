@@ -147,14 +147,17 @@ pub(crate) fn validate_mount(path: &Path) -> Result<(), OpenWorkError> {
 pub(crate) fn collect_output_paths(
     root: &Path,
 ) -> Result<Vec<RelativeArtifactPath>, OpenWorkError> {
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        output: &mut Vec<RelativeArtifactPath>,
-    ) -> Result<(), OpenWorkError> {
+    let mut output = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    let mut entries_seen = 0_u32;
+    while let Some(directory) = directories.pop() {
         for entry in
             fs::read_dir(directory).map_err(|_| artifact_error("output cannot be scanned"))?
         {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > 4096 {
+                return Err(artifact_error("sandbox output tree is too large"));
+            }
             let entry = entry.map_err(|_| artifact_error("output entry is invalid"))?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
@@ -163,7 +166,7 @@ pub(crate) fn collect_output_paths(
                 return Err(artifact_error("output contains a symlink or special file"));
             }
             if metadata.is_dir() {
-                visit(root, &path, output)?;
+                directories.push(path);
             } else {
                 if output.len() >= 1024 {
                     return Err(artifact_error("sandbox produced too many files"));
@@ -178,10 +181,7 @@ pub(crate) fn collect_output_paths(
                 output.push(RelativeArtifactPath::parse(portable)?);
             }
         }
-        Ok(())
     }
-    let mut output = Vec::new();
-    visit(root, root, &mut output)?;
     output.sort();
     Ok(output)
 }

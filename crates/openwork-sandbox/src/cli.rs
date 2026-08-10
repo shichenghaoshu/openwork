@@ -98,14 +98,23 @@ impl DockerCli for SystemDockerCli {
         let budget = Arc::new(Mutex::new(CaptureBudget::new(max_output_bytes)));
         let stdout_reader = spawn_reader(stdout, Arc::clone(&budget));
         let stderr_reader = spawn_reader(stderr, Arc::clone(&budget));
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(|_| {
-                sandbox_error(ErrorCode::ExecutionFailed, "Docker CLI status failed")
-            })? {
-                break status;
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_reader(stdout_reader);
+                    let _ = join_reader(stderr_reader);
+                    return Err(sandbox_error(
+                        ErrorCode::ExecutionFailed,
+                        "Docker CLI status failed",
+                    ));
+                }
             }
-            if Instant::now() >= deadline {
+            if started.elapsed() >= timeout {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_reader(stdout_reader);

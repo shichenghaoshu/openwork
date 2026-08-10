@@ -413,7 +413,7 @@ fn push_pair(args: &mut Vec<OsString>, key: impl Into<OsString>, value: impl Int
 fn decode_output(bytes: Vec<u8>) -> (String, bool) {
     match String::from_utf8(bytes) {
         Ok(value) => (value, false),
-        Err(_) => ("[non-UTF-8 output omitted]".to_owned(), true),
+        Err(_) => (String::new(), true),
     }
 }
 

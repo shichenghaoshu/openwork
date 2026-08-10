@@ -390,6 +390,20 @@ fn cleanup_failure_is_machine_readable_in_result() {
     );
 }
 
+#[test]
+fn oversized_output_tree_fails_without_recursive_scanner_growth() {
+    let fixture = fixture(2, 1024);
+    for index in 0..4097 {
+        fs::create_dir(fixture.output.join(format!("directory-{index}"))).unwrap();
+    }
+    let backend = DockerSandbox::new(Arc::new(FakeDockerCli::successful()), fixture.temporary);
+    let result = backend
+        .execute(&fixture.request)
+        .expect("bounded scan result");
+    assert_eq!(result.termination, SandboxTermination::Failed);
+    assert!(result.output_paths.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_output_is_rejected_as_untrusted_artifact() {
