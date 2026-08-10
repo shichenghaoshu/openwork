@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/openwork-cli",
+  "crates/openwork-control-api",
   "crates/openwork-config",
   "crates/openwork-core",
   "crates/openwork-doctor",
