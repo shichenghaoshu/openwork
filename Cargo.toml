@@ -9,6 +9,7 @@ members = [
   "crates/openwork-platform",
   "crates/openwork-policy",
   "crates/openwork-runtime",
+  "crates/openwork-sandbox",
 ]
 resolver = "2"
 

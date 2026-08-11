@@ -1,0 +1,18 @@
+[package]
+name = "openwork-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openwork-core = { path = "../openwork-core" }
+openwork-execution = { path = "../openwork-execution" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
