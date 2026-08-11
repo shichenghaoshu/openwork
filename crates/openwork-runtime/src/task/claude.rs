@@ -14,7 +14,10 @@ pub const CLAUDE_REQUIRED_FLAGS: &[&str] = &[
     "--output-format stream-json",
     "--safe-mode",
     "--no-session-persistence",
+    "--no-chrome",
+    "--disable-slash-commands",
     "--tools",
+    "--permission-mode",
     "--strict-mcp-config",
 ];
 
@@ -123,7 +126,7 @@ impl ClaudeTaskDecoder {
                     }
                     self.events.event(
                         RuntimeEventPayload::ToolCall {
-                            name: name.to_owned(),
+                            name: bounded_redacted_text(name)?,
                             parameters: bounded_redacted_value(
                                 block.get("input").unwrap_or(&Value::Null),
                             )?,

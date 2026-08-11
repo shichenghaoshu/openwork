@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"session_fixture","capabilities":["interrupt_receipt_v1"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"analysis TOKEN=visible complete"},{"type":"tool_use","name":"Write","input":{"file_path":"/workspace/output/summary.md","api_key":"must-redact"}}]}}
+{"type":"system","subtype":"api_retry","authorization":"Bearer must-redact","attempt":1}
+{"type":"result","subtype":"success","is_error":false,"result":"summary complete"}

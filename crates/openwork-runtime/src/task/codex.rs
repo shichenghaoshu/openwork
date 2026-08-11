@@ -15,7 +15,11 @@ pub const CODEX_REQUIRED_FLAGS: &[&str] = &[
     "--ephemeral",
     "--ignore-user-config",
     "--ignore-rules",
+    "--strict-config",
+    "--ask-for-approval never",
     "--sandbox",
+    "--cd",
+    "--skip-git-repo-check",
 ];
 
 /// Prepares the current documented Codex non-interactive JSONL protocol.

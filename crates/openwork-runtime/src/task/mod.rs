@@ -23,6 +23,8 @@ pub const CLAUDE_HEADLESS_URL: &str = "https://code.claude.com/docs/en/headless"
 pub const CODEX_NON_INTERACTIVE_URL: &str = "https://learn.chatgpt.com/docs/non-interactive-mode";
 pub const CODEX_CLI_REFERENCE_URL: &str =
     "https://learn.chatgpt.com/docs/developer-commands?surface=cli";
+pub const PROVIDER_VERSION_GATE_POLICY: &str =
+    "Require every documented flag; no unverified minimum CLI version is claimed.";
 
 pub const MAX_PROVIDER_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_RUNTIME_EVENT_BYTES: usize = 16 * 1024;
@@ -77,7 +79,8 @@ pub trait RuntimeEventDecoder: Send {
     ///
     /// # Errors
     ///
-    /// Rejects a duplicate terminal event or an exhausted event budget.
+    /// Rejects an exhausted event budget. Returns `None` after a provider
+    /// failure has already made the stream terminal.
     fn finish(&mut self, exit_code: i32) -> Result<Option<RuntimeEvent>, OpenWorkError>;
 }
 
@@ -239,6 +242,15 @@ pub(crate) fn validate_task(task: &RuntimeTask, provider: &str) -> Result<(), Op
     {
         return Err(runtime_error(
             "runtime task requests an unsupported capability",
+        ));
+    }
+    if !task
+        .capabilities
+        .iter()
+        .any(|capability| capability == "filesystem.read")
+    {
+        return Err(runtime_error(
+            "provider tasks require the filesystem.read capability",
         ));
     }
     Ok(())

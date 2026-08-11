@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started","authorization":"Bearer must-redact"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"report TOKEN=visible ready"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"printf TOKEN=must-redact","status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/workspace/output/summary.md","kind":"add"}],"status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":4}}
