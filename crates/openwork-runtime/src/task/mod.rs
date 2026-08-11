@@ -1,11 +1,10 @@
 //! Provider task preparation and bounded JSONL decoding for sandbox execution.
 
-// Provider modules are added in subsequent independently compilable stacked commits.
-#![allow(dead_code)]
-
 mod claude;
+mod codex;
 
-pub use claude::{ClaudeTaskAdapter, ClaudeTaskDecoder};
+pub use claude::{CLAUDE_REQUIRED_FLAGS, CLAUDE_RUNTIME_ID, ClaudeTaskAdapter, ClaudeTaskDecoder};
+pub use codex::{CODEX_REQUIRED_FLAGS, CODEX_RUNTIME_ID, CodexTaskAdapter, CodexTaskDecoder};
 
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
