@@ -3,6 +3,10 @@
 // Provider modules are added in subsequent independently compilable stacked commits.
 #![allow(dead_code)]
 
+mod claude;
+
+pub use claude::{ClaudeTaskAdapter, ClaudeTaskDecoder};
+
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
     EXECUTION_SCHEMA_VERSION, RedactedAuditMetadata, RunId, RuntimeEvent, RuntimeEventPayload,
