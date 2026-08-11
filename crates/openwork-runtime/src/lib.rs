@@ -8,6 +8,7 @@ mod registry;
 mod system_downloader;
 
 pub mod compatibility;
+pub mod task;
 
 pub use claude::ClaudeRuntime;
 pub use codex::CodexRuntime;

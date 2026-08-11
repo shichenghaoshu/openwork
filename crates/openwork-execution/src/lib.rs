@@ -251,6 +251,11 @@ impl SandboxWorkingDirectory {
         }
         Ok(Self(value))
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
