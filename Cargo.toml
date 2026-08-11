@@ -4,6 +4,7 @@ members = [
   "crates/openwork-config",
   "crates/openwork-core",
   "crates/openwork-doctor",
+  "crates/openwork-e2e",
   "crates/openwork-execution",
   "crates/openwork-installer",
   "crates/openwork-platform",

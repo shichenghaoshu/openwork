@@ -1,0 +1,7 @@
+customer_id,customer_name,july_sales,august_sales,change,decline
+C003,Crown,7000,4000,-3000,3000
+C001,Acme,8000,6000,-2000,2000
+C004,Delta,4000,4000,0,0
+C005,Echo,9000,9000,0,0
+C002,Beta,5000,5500,500,-500
+TOTAL,,33000,28500,-4500,4500

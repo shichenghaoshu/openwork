@@ -1188,6 +1188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openwork-e2e"
+version = "0.1.0"
+dependencies = [
+ "openwork-execution",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "openwork-execution"
 version = "0.1.0"
 dependencies = [
