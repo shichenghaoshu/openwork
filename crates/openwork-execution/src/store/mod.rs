@@ -501,6 +501,7 @@ impl ApprovalRepository for InMemoryExecutionStore {
         updated.consumed_at = Some(trusted_now);
         updated.validate()?;
         let claim = ActionClaim {
+            approval_id: updated.id.clone(),
             run_id: action.run_id.clone(),
             action_id: action.id.clone(),
             parameter_hash: action.parameter_hash().clone(),

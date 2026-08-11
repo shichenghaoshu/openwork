@@ -61,6 +61,7 @@ fn approval_is_single_use_and_claims_the_exact_action() {
         .consume_approval(&approval.id, 1, &action, actor("executor"), time(2))
         .expect("consume once");
     assert_eq!(consumed.approval.status, ApprovalStatus::Consumed);
+    assert_eq!(consumed.action_claim.approval_id, approval.id);
     assert_eq!(
         consumed.action_claim.parameter_hash,
         *action.parameter_hash()

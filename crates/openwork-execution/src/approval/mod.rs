@@ -9,6 +9,7 @@ use openwork_core::OpenWorkError;
 /// Durable proof that one exact approved action was claimed for execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionClaim {
+    pub approval_id: ApprovalId,
     pub run_id: RunId,
     pub action_id: ActionId,
     pub parameter_hash: Sha256Digest,
