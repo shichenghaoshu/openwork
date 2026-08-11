@@ -1,0 +1,12 @@
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release -p openwork-control-api
+
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+RUN groupadd --system --gid 65532 openwork \
+    && useradd --system --uid 65532 --gid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin openwork
+COPY --from=build /src/target/release/openwork-control-api /usr/local/bin/openwork-control-api
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/openwork-control-api"]
