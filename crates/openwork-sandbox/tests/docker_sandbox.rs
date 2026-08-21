@@ -33,6 +33,7 @@ enum StdinDeliveryMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KillMode {
     Succeeds,
+    SucceedsAfterStopDelay,
     Rejected,
 }
 
@@ -181,8 +182,15 @@ impl DockerCli for FakeDockerCli {
             Some("logs") => Ok(output(true, self.logs.clone(), max_output_bytes)),
             Some("kill") => {
                 self.release_stdin_delivery();
+                if self.kill_mode == KillMode::SucceedsAfterStopDelay {
+                    let mut inspect = self.inspect.lock().expect("inspect lock");
+                    inspect.clear();
+                    inspect.push_back(InspectMode::Exit);
+                    drop(inspect);
+                    thread::sleep(Duration::from_millis(100));
+                }
                 Ok(output(
-                    self.kill_mode == KillMode::Succeeds,
+                    self.kill_mode != KillMode::Rejected,
                     Vec::new(),
                     max_output_bytes,
                 ))
@@ -467,6 +475,32 @@ fn failed_cancel_transport_never_reports_cancelled() {
     let result = handle.join().expect("execute thread").expect("result");
     assert_ne!(result.termination, SandboxTermination::Cancelled);
     assert!(cli.command_names().contains(&"rm".to_owned()));
+}
+
+#[test]
+fn successful_cancel_cannot_race_stopped_container_inspection() {
+    let fixture = fixture(10, 1024);
+    let run_id = fixture.request.run_id.clone();
+    let mut fake = FakeDockerCli::successful();
+    fake.inspect = Mutex::new(VecDeque::from([InspectMode::Running]));
+    fake.kill_mode = KillMode::SucceedsAfterStopDelay;
+    let cli = Arc::new(fake);
+    let backend = Arc::new(
+        DockerSandbox::new(Arc::clone(&cli), fixture.temporary)
+            .with_poll_interval(Duration::from_millis(1)),
+    );
+    let executing = Arc::clone(&backend);
+    let request = fixture.request;
+    let handle = thread::spawn(move || executing.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !cli.command_names().contains(&"inspect".to_owned()) {
+        assert!(Instant::now() < deadline, "sandbox did not start polling");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    backend.cancel(&run_id).expect("kill accepted");
+    let result = handle.join().expect("execute thread").expect("result");
+    assert_eq!(result.termination, SandboxTermination::Cancelled);
 }
 
 #[test]

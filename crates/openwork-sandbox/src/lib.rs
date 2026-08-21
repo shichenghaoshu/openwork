@@ -20,7 +20,7 @@ use openwork_execution::{
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,7 +36,7 @@ const HEALTH_UNAVAILABLE: u8 = 2;
 #[derive(Debug)]
 struct ActiveContainer {
     id: String,
-    cancellation_confirmed: AtomicBool,
+    cancellation_confirmed: Mutex<bool>,
 }
 
 /// Host-side backend that creates one disposable, networkless container per request.
@@ -134,7 +134,7 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
         }
         let active = Arc::new(ActiveContainer {
             id: container_id.clone(),
-            cancellation_confirmed: AtomicBool::new(false),
+            cancellation_confirmed: Mutex::new(false),
         });
         let key = run_key(&request.run_id)?;
         let _registration =
@@ -274,7 +274,14 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
     ) -> (SandboxTermination, Option<i32>) {
         let mut attachment_failed = false;
         loop {
-            if active.cancellation_confirmed.load(Ordering::Acquire) {
+            // Hold the cancellation lock across inspection and every competing
+            // kill decision.  A successful cancel therefore cannot stop the
+            // container before its confirmation becomes visible to this
+            // monitor.
+            let Ok(cancellation_confirmed) = active.cancellation_confirmed.lock() else {
+                return (SandboxTermination::Failed, None);
+            };
+            if *cancellation_confirmed {
                 return (SandboxTermination::Cancelled, None);
             }
             if Instant::now() >= deadline {
@@ -299,7 +306,10 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
                     );
                     return (SandboxTermination::Failed, None);
                 }
-                Ok(state) if state.running => thread::sleep(self.poll_interval),
+                Ok(state) if state.running => {
+                    drop(cancellation_confirmed);
+                    thread::sleep(self.poll_interval);
+                }
                 Ok(state) if state.oom_killed => {
                     return (SandboxTermination::OutOfMemory, None);
                 }
@@ -360,14 +370,22 @@ impl<C: DockerCli, E: ContainerEngine> SandboxBackend for ContainerSandbox<C, E>
             .get(&key)
             .cloned()
             .ok_or_else(|| sandbox_error(ErrorCode::RunCancelled, "run has no active sandbox"))?;
+        let mut cancellation_confirmed = active
+            .cancellation_confirmed
+            .lock()
+            .map_err(|_| registry_error())?;
+        if *cancellation_confirmed {
+            return Ok(());
+        }
         let output = self.invoke(
             &self.engine.kill_arguments(&active.id),
             CONTROL_OUTPUT_LIMIT,
         )?;
         if output.success {
-            // This flag tells the monitor it may emit a cancellation result;
-            // never set it when the transport/engine rejected the kill.
-            active.cancellation_confirmed.store(true, Ordering::Release);
+            // The monitor cannot inspect the stopped container until this
+            // confirmation is published because both operations use the same
+            // lock.
+            *cancellation_confirmed = true;
             Ok(())
         } else {
             Err(sandbox_error(

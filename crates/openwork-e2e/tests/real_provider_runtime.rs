@@ -146,8 +146,13 @@ fn real_provider_host_only_jsonl_is_bounded_and_decodes_to_a_terminal_event() {
         "prompt must be supplied only on stdin"
     );
 
-    let captured = run_bounded(&invocation, workspace.path(), config.timeout)
-        .expect("real provider HostOnly process");
+    let captured = run_bounded(
+        &invocation,
+        config.provider,
+        workspace.path(),
+        config.timeout,
+    )
+    .expect("real provider HostOnly process");
     assert!(
         !captured.stdout.truncated,
         "provider stdout exceeded capture limit"
@@ -235,6 +240,14 @@ fn provider_harness_configuration_fails_closed() {
         )
         .is_err()
     );
+    assert_eq!(
+        provider_auth_allowlist(Provider::Claude),
+        &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+    );
+    assert_eq!(
+        provider_auth_allowlist(Provider::Codex),
+        &["OPENAI_API_KEY"]
+    );
 }
 
 struct ProcessCapture {
@@ -245,6 +258,7 @@ struct ProcessCapture {
 
 fn run_bounded(
     invocation: &openwork_runtime::task::RuntimeInvocation,
+    provider: Provider,
     host_working_directory: &Path,
     timeout: Duration,
 ) -> Result<ProcessCapture, &'static str> {
@@ -253,7 +267,7 @@ fn run_bounded(
         .args(invocation.command.arguments())
         .current_dir(host_working_directory)
         .env_clear();
-    copy_environment_allowlist(&mut command);
+    copy_environment_allowlist(&mut command, provider);
     command.envs(invocation.command.environment());
     let mut child = command
         .stdin(Stdio::piped())
@@ -327,7 +341,7 @@ fn cancel_process(child: &mut Child) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn copy_environment_allowlist(command: &mut Command) {
+fn copy_environment_allowlist(command: &mut Command, provider: Provider) {
     // The CLI executable path is absolute, but Node-based wrappers may require
     // PATH. HOME/XDG locations allow the CLI's own authenticated credential
     // store without copying the surrounding process environment wholesale.
@@ -343,15 +357,17 @@ fn copy_environment_allowlist(command: &mut Command) {
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     ];
-    const PROVIDER_AUTH: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "OPENAI_API_KEY",
-    ];
-    for key in COMMON.iter().chain(PROVIDER_AUTH) {
+    for key in COMMON.iter().chain(provider_auth_allowlist(provider)) {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
         }
+    }
+}
+
+const fn provider_auth_allowlist(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Claude => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+        Provider::Codex => &["OPENAI_API_KEY"],
     }
 }
 

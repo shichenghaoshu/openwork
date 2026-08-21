@@ -158,10 +158,22 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
         .claim_next_run(
             actor(),
             timestamp("2026-08-21T02:30:01Z"),
-            Duration::seconds(30),
+            Duration::hours(1),
         )
         .expect("claim")
         .expect("lease");
+    let lease = store
+        .heartbeat_lease(
+            &lease,
+            timestamp("2026-08-21T03:29:01Z"),
+            Duration::hours(1),
+        )
+        .expect("heartbeat extends beyond the initial lease hour");
+    assert_eq!(
+        lease.expires_at,
+        timestamp("2026-08-21T04:29:01Z"),
+        "each heartbeat is bounded, but total task duration is not capped at one hour"
+    );
     assert!(
         store
             .transition_run(
@@ -169,7 +181,7 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
                 lease.run.revision,
                 RunStatus::Running,
                 None,
-                AuditAppend::new(actor(), timestamp("2026-08-21T02:30:02Z")),
+                AuditAppend::new(actor(), timestamp("2026-08-21T03:29:02Z")),
             )
             .is_err()
     );
@@ -178,7 +190,7 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
             &lease,
             lease.run.revision,
             RunStatus::Running,
-            timestamp("2026-08-21T02:30:02Z"),
+            timestamp("2026-08-21T03:29:02Z"),
         )
         .expect("start");
     assert!(
@@ -187,13 +199,13 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
                 &lease,
                 lease.run.revision,
                 RunStatus::AwaitingApproval,
-                timestamp("2026-08-21T02:30:03Z"),
+                timestamp("2026-08-21T03:29:03Z"),
             )
             .is_err()
     );
     assert_eq!(
         store
-            .request_cancel(&run.id, actor(), timestamp("2026-08-21T02:30:03Z"))
+            .request_cancel(&run.id, actor(), timestamp("2026-08-21T03:29:03Z"))
             .expect("request cancellation"),
         CancelRequest::Requested
     );
@@ -204,7 +216,7 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
                 running.run.revision,
                 RunStatus::Succeeded,
                 None,
-                timestamp("2026-08-21T02:30:04Z"),
+                timestamp("2026-08-21T03:29:04Z"),
             )
             .is_err()
     );
@@ -215,7 +227,7 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
                 running.run.revision,
                 RunStatus::Failed,
                 Some("runtime stopped after cancellation"),
-                timestamp("2026-08-21T02:30:04Z"),
+                timestamp("2026-08-21T03:29:04Z"),
             )
             .expect("failure may complete")
             .status,
@@ -225,7 +237,7 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
         store
             .heartbeat_lease(
                 &running,
-                timestamp("2026-08-21T02:30:05Z"),
+                timestamp("2026-08-21T03:29:05Z"),
                 Duration::seconds(30),
             )
             .is_err()

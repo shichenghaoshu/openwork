@@ -21,8 +21,7 @@ CREATE TABLE run_leases (
     owner_id TEXT NOT NULL CHECK (length(owner_id) BETWEEN 1 AND 256 AND btrim(owner_id) <> ''),
     acquired_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
-    CHECK (expires_at > acquired_at),
-    CHECK (expires_at <= acquired_at + INTERVAL '1 hour')
+    CHECK (expires_at > acquired_at)
 );
 
 CREATE INDEX run_leases_expiry_idx ON run_leases (expires_at);
