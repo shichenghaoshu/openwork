@@ -30,6 +30,12 @@ enum StdinDeliveryMode {
     BlockUntilRelease,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KillMode {
+    Succeeds,
+    Rejected,
+}
+
 struct FakeDockerCli {
     calls: Mutex<Vec<Vec<String>>>,
     inspect: Mutex<VecDeque<InspectMode>>,
@@ -38,6 +44,7 @@ struct FakeDockerCli {
     output_directory: Mutex<Option<PathBuf>>,
     create_success: bool,
     start_transport_error: bool,
+    kill_mode: KillMode,
     stdin_delivery: StdinDeliveryMode,
     stdin_release: Mutex<bool>,
     stdin_release_changed: Condvar,
@@ -56,6 +63,7 @@ impl FakeDockerCli {
             output_directory: Mutex::new(None),
             create_success: true,
             start_transport_error: false,
+            kill_mode: KillMode::Succeeds,
             stdin_delivery: StdinDeliveryMode::Immediate,
             stdin_release: Mutex::new(false),
             stdin_release_changed: Condvar::new(),
@@ -173,7 +181,11 @@ impl DockerCli for FakeDockerCli {
             Some("logs") => Ok(output(true, self.logs.clone(), max_output_bytes)),
             Some("kill") => {
                 self.release_stdin_delivery();
-                Ok(output(true, Vec::new(), max_output_bytes))
+                Ok(output(
+                    self.kill_mode == KillMode::Succeeds,
+                    Vec::new(),
+                    max_output_bytes,
+                ))
             }
             Some("rm") => Ok(output(self.remove_success, Vec::new(), max_output_bytes)),
             _ => panic!("unexpected Docker command: {args:?}"),
@@ -429,6 +441,62 @@ fn stdin_attachment_does_not_block_cancel_polling() {
         backend.cancel(&run_id).unwrap_err().code,
         ErrorCode::RunCancelled
     );
+}
+
+#[test]
+fn failed_cancel_transport_never_reports_cancelled() {
+    let fixture = fixture(2, 1024);
+    let run_id = fixture.request.run_id.clone();
+    let mut fake = FakeDockerCli::successful();
+    fake.inspect = Mutex::new(VecDeque::from([InspectMode::Running, InspectMode::Exit]));
+    fake.kill_mode = KillMode::Rejected;
+    let cli = Arc::new(fake);
+    let backend = Arc::new(
+        DockerSandbox::new(Arc::clone(&cli), fixture.temporary)
+            .with_poll_interval(Duration::from_millis(2)),
+    );
+    let executing = Arc::clone(&backend);
+    let request = fixture.request;
+    let handle = thread::spawn(move || executing.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !cli.command_names().contains(&"inspect".to_owned()) {
+        assert!(Instant::now() < deadline, "sandbox did not start polling");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(backend.cancel(&run_id).is_err());
+    let result = handle.join().expect("execute thread").expect("result");
+    assert_ne!(result.termination, SandboxTermination::Cancelled);
+    assert!(cli.command_names().contains(&"rm".to_owned()));
+}
+
+#[test]
+fn cancellation_with_cleanup_failure_is_not_a_terminal_cancel_claim() {
+    let fixture = fixture_with_stdin(10, 1024, b"prompt".to_vec());
+    let run_id = fixture.request.run_id.clone();
+    let mut fake = FakeDockerCli::successful();
+    fake.inspect = Mutex::new(VecDeque::from([InspectMode::Running]));
+    fake.stdin_delivery = StdinDeliveryMode::BlockUntilRelease;
+    fake.remove_success = false;
+    let cli = Arc::new(fake);
+    let backend = Arc::new(
+        DockerSandbox::new(Arc::clone(&cli), fixture.temporary)
+            .with_poll_interval(Duration::from_millis(2)),
+    );
+    let executing = Arc::clone(&backend);
+    let request = fixture.request;
+    let handle = thread::spawn(move || executing.execute(&request));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !cli.command_names().contains(&"attach".to_owned()) {
+        assert!(Instant::now() < deadline, "sandbox did not attach stdin");
+        thread::sleep(Duration::from_millis(2));
+    }
+    backend.cancel(&run_id).expect("kill accepted");
+    let result = handle.join().expect("execute thread").expect("result");
+    assert_eq!(result.termination, SandboxTermination::Failed);
+    assert!(matches!(
+        result.cleanup,
+        SandboxCleanupStatus::Failed { .. }
+    ));
 }
 
 #[test]

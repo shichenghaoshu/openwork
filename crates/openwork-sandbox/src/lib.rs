@@ -36,7 +36,7 @@ const HEALTH_UNAVAILABLE: u8 = 2;
 #[derive(Debug)]
 struct ActiveContainer {
     id: String,
-    cancel_requested: AtomicBool,
+    cancellation_confirmed: AtomicBool,
 }
 
 /// Host-side backend that creates one disposable, networkless container per request.
@@ -134,7 +134,7 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
         }
         let active = Arc::new(ActiveContainer {
             id: container_id.clone(),
-            cancel_requested: AtomicBool::new(false),
+            cancellation_confirmed: AtomicBool::new(false),
         });
         let key = run_key(&request.run_id)?;
         let _registration =
@@ -163,6 +163,15 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
                 Vec::new()
             };
         let cleanup = combine_cleanup(cleanup, temporary.close());
+        // A cancelled terminal result is a confirmation claim.  Do not emit it
+        // when disposal was not proven: an operator must be able to distinguish
+        // "kill was requested" from a sandbox that may still be reachable.
+        if matches!(termination, SandboxTermination::Cancelled)
+            && !matches!(cleanup, SandboxCleanupStatus::Succeeded)
+        {
+            termination = SandboxTermination::Failed;
+            exit_code = None;
+        }
         let (stdout, stdout_invalid) = decode_output(logs.stdout);
         let (stderr, stderr_invalid) = decode_output(logs.stderr);
         let result = SandboxResult {
@@ -265,19 +274,15 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
     ) -> (SandboxTermination, Option<i32>) {
         let mut attachment_failed = false;
         loop {
-            if active.cancel_requested.load(Ordering::Acquire) {
-                let _ = self.invoke(
-                    &self.engine.kill_arguments(container_id),
-                    CONTROL_OUTPUT_LIMIT,
-                );
+            if active.cancellation_confirmed.load(Ordering::Acquire) {
                 return (SandboxTermination::Cancelled, None);
             }
             if Instant::now() >= deadline {
-                let _ = self.invoke(
-                    &self.engine.kill_arguments(container_id),
-                    CONTROL_OUTPUT_LIMIT,
-                );
-                return (SandboxTermination::TimedOut, None);
+                return if self.kill(container_id) {
+                    (SandboxTermination::TimedOut, None)
+                } else {
+                    (SandboxTermination::Failed, None)
+                };
             }
             if let Some(attachment) = attachment {
                 match attachment.try_recv() {
@@ -310,6 +315,14 @@ impl<C: DockerCli, E: ContainerEngine> ContainerSandbox<C, E> {
                 }
             }
         }
+    }
+
+    fn kill(&self, container_id: &str) -> bool {
+        self.invoke(
+            &self.engine.kill_arguments(container_id),
+            CONTROL_OUTPUT_LIMIT,
+        )
+        .is_ok_and(|output| output.success)
     }
 }
 
@@ -347,12 +360,14 @@ impl<C: DockerCli, E: ContainerEngine> SandboxBackend for ContainerSandbox<C, E>
             .get(&key)
             .cloned()
             .ok_or_else(|| sandbox_error(ErrorCode::RunCancelled, "run has no active sandbox"))?;
-        active.cancel_requested.store(true, Ordering::Release);
         let output = self.invoke(
             &self.engine.kill_arguments(&active.id),
             CONTROL_OUTPUT_LIMIT,
         )?;
         if output.success {
+            // This flag tells the monitor it may emit a cancellation result;
+            // never set it when the transport/engine rejected the kill.
+            active.cancellation_confirmed.store(true, Ordering::Release);
             Ok(())
         } else {
             Err(sandbox_error(
