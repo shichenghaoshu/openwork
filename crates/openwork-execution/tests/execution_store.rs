@@ -1,11 +1,350 @@
 use openwork_execution::audit::AuditAppend;
-use openwork_execution::store::{ExecutionStore, InMemoryExecutionStore};
+use openwork_execution::store::{
+    CancelRequest, CancellationEvidence, ExecutionStore, InMemoryExecutionStore, LeaseToken,
+    RunLease, RunQueueRepository,
+};
 use openwork_execution::{
     ActorId, Artifact, ArtifactId, ArtifactSizeBytes, AuditEventType, EXECUTION_SCHEMA_VERSION,
-    RelativeArtifactPath, Run, RunId, RunStatus, UtcTimestamp, sha256_bytes,
+    RelativeArtifactPath, Run, RunId, RunStatus, SandboxCleanupStatus, SandboxResult,
+    SandboxTermination, UtcTimestamp, sha256_bytes,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
+use time::Duration;
+
+#[test]
+fn queued_cancel_is_immediate_but_leased_cancel_requires_worker_confirmation() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-10T00:00:01Z"))
+            .expect("cancel"),
+        CancelRequest::Cancelled
+    );
+    assert_eq!(
+        store.get_run(&run.id).expect("read").expect("run").status,
+        RunStatus::Cancelled
+    );
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-10T00:00:00Z"))
+            .expect("terminal cancellation replay"),
+        CancelRequest::AlreadyTerminal(RunStatus::Cancelled)
+    );
+
+    let mut leased = queued_run();
+    leased.id = RunId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a03").expect("UUIDv7");
+    leased.created_at = timestamp("2026-08-10T00:01:00Z");
+    leased.updated_at = timestamp("2026-08-10T00:01:00Z");
+    store
+        .create_run(leased.clone(), audit("2026-08-10T00:01:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-10T00:01:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    assert_eq!(
+        store
+            .request_cancel(&leased.id, actor(), timestamp("2026-08-10T00:01:02Z"))
+            .expect("request"),
+        CancelRequest::Requested
+    );
+    assert!(
+        store
+            .lease_cancel_requested(&lease, timestamp("2026-08-10T00:01:02Z"))
+            .expect("poll")
+    );
+    assert_eq!(
+        store
+            .request_cancel(&leased.id, actor(), timestamp("2026-08-10T00:01:01Z"))
+            .expect("active cancellation replay"),
+        CancelRequest::Requested
+    );
+    assert_eq!(
+        store
+            .get_run(&leased.id)
+            .expect("read")
+            .expect("run")
+            .status,
+        RunStatus::Planning
+    );
+}
+
+#[test]
+fn expired_lease_fails_closed_without_requeue() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-10T00:00:01Z"),
+            Duration::seconds(1),
+        )
+        .expect("claim")
+        .expect("lease");
+    assert_eq!(
+        store
+            .recover_expired_leases(actor(), timestamp("2026-08-10T00:00:02Z"))
+            .expect("recover"),
+        vec![run.id.clone()]
+    );
+    assert_eq!(
+        store.get_run(&run.id).expect("read").expect("run").status,
+        RunStatus::Failed
+    );
+    assert!(
+        store
+            .heartbeat_lease(
+                &lease,
+                timestamp("2026-08-10T00:00:02Z"),
+                Duration::seconds(1)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim_next_run(
+                actor(),
+                timestamp("2026-08-10T00:00:03Z"),
+                Duration::seconds(1)
+            )
+            .expect("claim")
+            .is_none()
+    );
+}
+
+#[test]
+fn cancellation_evidence_cannot_cross_lease_capabilities() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-10T00:00:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    store
+        .request_cancel(&run.id, actor(), timestamp("2026-08-10T00:00:02Z"))
+        .expect("request cancellation");
+    let result = SandboxResult {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        run_id: run.id.clone(),
+        sandbox_id: "sandbox-for-current-lease".to_owned(),
+        termination: SandboxTermination::Cancelled,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated: false,
+        started_at: timestamp("2026-08-10T00:00:01Z"),
+        completed_at: timestamp("2026-08-10T00:00:03Z"),
+        output_paths: Vec::new(),
+        cleanup: SandboxCleanupStatus::Succeeded,
+    };
+    let evidence = CancellationEvidence::verify(&lease, &result).expect("valid evidence");
+    let different_lease = RunLease {
+        token: LeaseToken::generate(),
+        ..lease.clone()
+    };
+
+    assert!(
+        store
+            .confirm_cancel(
+                &different_lease,
+                timestamp("2026-08-10T00:00:04Z"),
+                evidence.clone(),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .confirm_cancel(&lease, timestamp("2026-08-10T00:00:04Z"), evidence)
+            .expect("current lease confirms cancellation")
+            .status,
+        RunStatus::Cancelled
+    );
+}
+
+#[test]
+fn leased_lifecycle_requires_current_capability_and_removes_it_on_completion() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-10T00:00:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    assert!(
+        store
+            .transition_run(
+                &run.id,
+                lease.run.revision,
+                RunStatus::Running,
+                None,
+                audit("2026-08-10T00:00:02Z"),
+            )
+            .is_err()
+    );
+    let running = store
+        .transition_leased_run(
+            &lease,
+            lease.run.revision,
+            RunStatus::Running,
+            timestamp("2026-08-10T00:00:02Z"),
+        )
+        .expect("lease-bound start");
+    assert_eq!(running.run.status, RunStatus::Running);
+    assert_eq!(running.run.revision, lease.run.revision + 1);
+    assert_eq!(
+        store
+            .heartbeat_lease(
+                &running,
+                timestamp("2026-08-10T00:00:02Z"),
+                Duration::seconds(30),
+            )
+            .expect("heartbeat")
+            .run,
+        running.run
+    );
+    assert!(
+        store
+            .transition_leased_run(
+                &lease,
+                lease.run.revision,
+                RunStatus::AwaitingApproval,
+                timestamp("2026-08-10T00:00:03Z"),
+            )
+            .is_err()
+    );
+    let completed = store
+        .complete_leased_run(
+            &running,
+            running.run.revision,
+            RunStatus::Succeeded,
+            None,
+            timestamp("2026-08-10T00:00:03Z"),
+        )
+        .expect("lease-bound completion");
+    assert_eq!(completed.status, RunStatus::Succeeded);
+    assert!(
+        store
+            .heartbeat_lease(
+                &running,
+                timestamp("2026-08-10T00:00:04Z"),
+                Duration::seconds(30),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn cancellation_intent_rejects_success_but_allows_failure_and_orphans_fail_closed() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-10T00:00:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    let running = store
+        .transition_leased_run(
+            &lease,
+            lease.run.revision,
+            RunStatus::Running,
+            timestamp("2026-08-10T00:00:02Z"),
+        )
+        .expect("start");
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-10T00:00:03Z"))
+            .expect("intent"),
+        CancelRequest::Requested
+    );
+    assert!(
+        store
+            .complete_leased_run(
+                &running,
+                running.run.revision,
+                RunStatus::Succeeded,
+                None,
+                timestamp("2026-08-10T00:00:04Z"),
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .complete_leased_run(
+                &running,
+                running.run.revision,
+                RunStatus::Cancelled,
+                None,
+                timestamp("2026-08-10T00:00:04Z"),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .complete_leased_run(
+                &running,
+                running.run.revision,
+                RunStatus::Failed,
+                Some("runtime stopped after cancellation"),
+                timestamp("2026-08-10T00:00:04Z"),
+            )
+            .expect("failure may close cancellation race")
+            .status,
+        RunStatus::Failed
+    );
+
+    let mut orphan = queued_run();
+    orphan.id = RunId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a04").expect("UUIDv7");
+    orphan.created_at = timestamp("2026-08-10T00:01:00Z");
+    orphan.updated_at = orphan.created_at;
+    store
+        .create_run(orphan.clone(), audit("2026-08-10T00:01:00Z"))
+        .expect("create orphan");
+    store
+        .transition_run(
+            &orphan.id,
+            0,
+            RunStatus::Planning,
+            None,
+            audit("2026-08-10T00:01:01Z"),
+        )
+        .expect("make orphan active");
+    assert!(
+        store
+            .request_cancel(&orphan.id, actor(), timestamp("2026-08-10T00:01:02Z"))
+            .is_err()
+    );
+}
 
 #[test]
 fn illegal_transition_is_atomic_and_audit_is_redacted() {

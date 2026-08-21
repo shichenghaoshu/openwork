@@ -3,22 +3,234 @@
 use openwork_execution::action_executor::ActionExecutionReceipt;
 use openwork_execution::approval::ApprovalRepository;
 use openwork_execution::audit::AuditAppend;
-use openwork_execution::store::ExecutionStore;
 use openwork_execution::store::postgres::{CRASH_RECOVERY_REASON, PostgresExecutionStore};
+use openwork_execution::store::{
+    CancelRequest, CancellationEvidence, ExecutionStore, RunQueueRepository,
+};
 use openwork_execution::{
     ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    ApprovalStatus, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus, UtcTimestamp,
-    sha256_bytes,
+    ApprovalStatus, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus,
+    SandboxCleanupStatus, SandboxResult, SandboxTermination, UtcTimestamp, sha256_bytes,
 };
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
+use time::Duration;
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 static DATABASE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static DATABASE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+#[test]
+fn postgres_queue_claim_and_cancel_are_transactional() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let run = create_run_in_status(&store, RunStatus::Queued);
+    let barrier = Arc::new(Barrier::new(3));
+    let attempts = ["worker:first", "worker:second"].map(|owner| {
+        let worker_store = store.clone();
+        let worker_barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            worker_barrier.wait();
+            worker_store.claim_next_run(
+                ActorId::parse(owner).expect("worker actor"),
+                timestamp("2026-08-21T01:00:01Z"),
+                Duration::seconds(30),
+            )
+        })
+    });
+    barrier.wait();
+    let claims = attempts.map(|attempt| attempt.join().expect("claim thread").expect("claim"));
+    assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    let lease = claims
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("one worker owns the run");
+    assert_eq!(lease.run.id, run.id);
+
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-21T01:00:02Z"))
+            .expect("request cancel"),
+        CancelRequest::Requested
+    );
+    assert!(
+        store
+            .lease_cancel_requested(&lease, timestamp("2026-08-21T01:00:02Z"))
+            .expect("poll cancellation")
+    );
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-21T01:00:01Z"))
+            .expect("idempotent active cancellation replay"),
+        CancelRequest::Requested
+    );
+    let sandbox_result = SandboxResult {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        run_id: run.id.clone(),
+        sandbox_id: "postgres-cancel-sandbox".to_owned(),
+        termination: SandboxTermination::Cancelled,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated: false,
+        started_at: timestamp("2026-08-21T01:00:01Z"),
+        completed_at: timestamp("2026-08-21T01:00:03Z"),
+        output_paths: Vec::new(),
+        cleanup: SandboxCleanupStatus::Succeeded,
+    };
+    let evidence =
+        CancellationEvidence::verify(&lease, &sandbox_result).expect("cancellation evidence");
+    let cancelled = store
+        .confirm_cancel(&lease, timestamp("2026-08-21T01:00:03Z"), evidence)
+        .expect("confirm cancellation");
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-21T01:00:01Z"))
+            .expect("idempotent terminal cancellation replay"),
+        CancelRequest::AlreadyTerminal(RunStatus::Cancelled)
+    );
+    let events = store.audit_events(&run.id).expect("cancellation audit");
+    assert_eq!(
+        events.last().expect("confirmation event").actor,
+        lease.owner
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            AuditEventType::RunCreated,
+            AuditEventType::RuntimeSelected,
+            AuditEventType::CancelRequested,
+            AuditEventType::CancelConfirmed,
+        ]
+    );
+}
+
+#[test]
+fn postgres_expired_lease_fails_closed() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let expiring = create_run_in_status(&store, RunStatus::Queued);
+    store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-21T02:00:01Z"),
+            Duration::seconds(1),
+        )
+        .expect("claim expiring run")
+        .expect("expiring lease");
+    assert_eq!(
+        store
+            .recover_expired_leases(actor(), timestamp("2026-08-21T02:00:02Z"))
+            .expect("recover expired lease"),
+        vec![expiring.id.clone()]
+    );
+    assert_eq!(
+        store
+            .get_run(&expiring.id)
+            .expect("read recovered run")
+            .expect("recovered run")
+            .status,
+        RunStatus::Failed
+    );
+}
+
+#[test]
+fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let run = create_run_in_status(&store, RunStatus::Queued);
+    let lease = store
+        .claim_next_run(
+            actor(),
+            timestamp("2026-08-21T02:30:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    assert!(
+        store
+            .transition_run(
+                &run.id,
+                lease.run.revision,
+                RunStatus::Running,
+                None,
+                AuditAppend::new(actor(), timestamp("2026-08-21T02:30:02Z")),
+            )
+            .is_err()
+    );
+    let running = store
+        .transition_leased_run(
+            &lease,
+            lease.run.revision,
+            RunStatus::Running,
+            timestamp("2026-08-21T02:30:02Z"),
+        )
+        .expect("start");
+    assert!(
+        store
+            .transition_leased_run(
+                &lease,
+                lease.run.revision,
+                RunStatus::AwaitingApproval,
+                timestamp("2026-08-21T02:30:03Z"),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .request_cancel(&run.id, actor(), timestamp("2026-08-21T02:30:03Z"))
+            .expect("request cancellation"),
+        CancelRequest::Requested
+    );
+    assert!(
+        store
+            .complete_leased_run(
+                &running,
+                running.run.revision,
+                RunStatus::Succeeded,
+                None,
+                timestamp("2026-08-21T02:30:04Z"),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .complete_leased_run(
+                &running,
+                running.run.revision,
+                RunStatus::Failed,
+                Some("runtime stopped after cancellation"),
+                timestamp("2026-08-21T02:30:04Z"),
+            )
+            .expect("failure may complete")
+            .status,
+        RunStatus::Failed
+    );
+    assert!(
+        store
+            .heartbeat_lease(
+                &running,
+                timestamp("2026-08-21T02:30:05Z"),
+                Duration::seconds(30),
+            )
+            .is_err()
+    );
+}
 
 #[test]
 fn postgres_boundary_normalizes_precision_before_hashing_and_round_trips() {
@@ -515,10 +727,26 @@ fn postgres_store() -> Option<PostgresExecutionStore> {
         eprintln!("skipping real Postgres test: OPENWORK_TEST_DATABASE_URL is not set");
         return None;
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
+    assert_eq!(
+        env::var("OPENWORK_TEST_DATABASE_RESET").as_deref(),
+        Ok("1"),
+        "set OPENWORK_TEST_DATABASE_RESET=1 for the dedicated disposable test database"
+    );
+    assert!(
+        (database_url.contains("@127.0.0.1:") || database_url.contains("@localhost:"))
+            && database_url
+                .split_once('?')
+                .map_or(database_url.as_str(), |(base, _)| base)
+                .ends_with("/openwork_test"),
+        "Postgres concurrency tests require a loopback database named openwork_test"
+    );
+    let runtime = DATABASE_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test database runtime")
+    });
     let pool = runtime
         .block_on(async {
             let pool = PgPoolOptions::new()
@@ -528,6 +756,10 @@ fn postgres_store() -> Option<PostgresExecutionStore> {
                 .map_err(|error| error.to_string())?;
             MIGRATIONS
                 .run(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("TRUNCATE TABLE runs CASCADE")
+                .execute(&pool)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok::<_, String>(pool)

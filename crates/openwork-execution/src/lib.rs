@@ -448,6 +448,8 @@ pub enum AuditEventType {
     RunCompleted,
     RunFailed,
     ApprovalBindingMismatch,
+    CancelRequested,
+    CancelConfirmed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1784,6 +1786,8 @@ const fn audit_event_type_name(event_type: AuditEventType) -> &'static str {
         AuditEventType::RunCompleted => "run_completed",
         AuditEventType::RunFailed => "run_failed",
         AuditEventType::ApprovalBindingMismatch => "approval_binding_mismatch",
+        AuditEventType::CancelRequested => "cancel_requested",
+        AuditEventType::CancelConfirmed => "cancel_confirmed",
     }
 }
 

@@ -100,10 +100,12 @@ impl PostgresExecutionStore {
     /// control-plane process and appends one hash-chained `run_failed` event per
     /// recovered run.
     ///
-    /// `queued`, `awaiting_approval`, and terminal runs are intentionally left
-    /// unchanged. M1 has no `cancelling` state, so there is no such state to
-    /// recover. Rows are locked and revision-CAS updated in UUID order; repeated
-    /// calls are idempotent.
+    /// `queued`, `awaiting_approval`, terminal runs, and active runs with a
+    /// still-durable lease are intentionally left unchanged. Lease expiry is
+    /// handled separately by [`super::RunQueueRepository::recover_expired_leases`]
+    /// so a control API restart cannot kill a healthy independent worker. Rows
+    /// are locked and revision-CAS updated in UUID order; repeated calls are
+    /// idempotent.
     ///
     /// # Errors
     ///
@@ -124,6 +126,7 @@ impl PostgresExecutionStore {
                         completed_at, terminal_reason
                  FROM runs
                  WHERE status IN ('planning'::run_status, 'running'::run_status)
+                   AND NOT EXISTS (SELECT 1 FROM run_leases WHERE run_leases.run_id = runs.id)
                  ORDER BY id
                  FOR UPDATE",
             )
@@ -168,6 +171,420 @@ impl PostgresExecutionStore {
     }
 }
 
+impl super::RunQueueRepository for PostgresExecutionStore {
+    fn claim_next_run(
+        &self,
+        owner: ActorId,
+        now: UtcTimestamp,
+        ttl: time::Duration,
+    ) -> Result<Option<super::RunLease>, OpenWorkError> {
+        let now = postgres_timestamp(now);
+        let expires = super::checked_lease_expiry(now, ttl)?;
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let row = sqlx::query("SELECT id, runtime, workspace, status::text, revision, actor_id, prompt_sha256::text, created_at, updated_at, started_at, completed_at, terminal_reason FROM runs WHERE status = 'queued'::run_status AND NOT EXISTS (SELECT 1 FROM run_leases WHERE run_leases.run_id = runs.id) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT 1")
+                .fetch_optional(&mut *tx).await.map_err(internal_db)?;
+            let Some(row) = row else {
+                tx.commit().await.map_err(internal_db)?;
+                return Ok(None);
+            };
+            let current = row_to_run(&row)?;
+            if now < current.updated_at {
+                return Err(super::state_error("claim timestamp cannot move backwards"));
+            }
+            let updated = apply_run_transition(&current, RunStatus::Planning, None, now)?;
+            let sequence = next_audit_sequence_tx(&mut tx, &current.id).await?;
+            let event = AuditAppend::new(owner.clone(), now)
+                .with_run_status(RunStatus::Planning)
+                .build(
+                    current.id.clone(),
+                    sequence,
+                    AuditEventType::RuntimeSelected,
+                    last_audit_hash_tx(&mut tx, &current.id).await?,
+                )?;
+            let token = super::LeaseToken::generate();
+            update_run_tx(&mut tx, &updated, current.revision).await?;
+            sqlx::query("INSERT INTO run_leases (run_id, lease_token, owner_id, acquired_at, expires_at) VALUES ($1, $2, $3, $4, $5)")
+                .bind(current.id.0).bind(token.0).bind(owner.as_str()).bind(now.0).bind(expires.0).execute(&mut *tx).await.map_err(internal_db)?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(Some(super::RunLease {
+                run: updated,
+                token,
+                owner,
+                acquired_at: now,
+                expires_at: expires,
+                cancel_requested: false,
+            }))
+        })
+    }
+
+    fn heartbeat_lease(
+        &self,
+        lease: &super::RunLease,
+        now: UtcTimestamp,
+        ttl: time::Duration,
+    ) -> Result<super::RunLease, OpenWorkError> {
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let expires = super::checked_lease_expiry(now, ttl)?;
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, lease.run.revision, now).await?;
+            let requested: Option<time::OffsetDateTime> =
+                sqlx::query_scalar("SELECT cancel_requested_at FROM runs WHERE id=$1")
+                    .bind(lease.run.id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+            sqlx::query("UPDATE run_leases SET expires_at=$3 WHERE run_id=$1 AND lease_token=$2")
+                .bind(lease.run.id.0)
+                .bind(lease.token.0)
+                .bind(expires.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_db)?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(super::RunLease {
+                run: current,
+                expires_at: expires,
+                cancel_requested: requested.is_some(),
+                token: lease.token,
+                owner: lease.owner,
+                acquired_at: lease.acquired_at,
+            })
+        })
+    }
+
+    fn transition_leased_run(
+        &self,
+        lease: &super::RunLease,
+        expected_revision: u64,
+        next: RunStatus,
+        now: UtcTimestamp,
+    ) -> Result<super::RunLease, OpenWorkError> {
+        if next.is_terminal() {
+            return Err(super::state_error(
+                "leased transition target must be non-terminal",
+            ));
+        }
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, expected_revision, now).await?;
+            ensure_audit_time_tx(&mut tx, &lease.run.id, now, current.updated_at).await?;
+            let updated = apply_run_transition(&current, next, None, now)?;
+            let event = AuditAppend::new(lease.owner.clone(), now)
+                .with_run_status(next)
+                .build(
+                    lease.run.id.clone(),
+                    next_audit_sequence_tx(&mut tx, &lease.run.id).await?,
+                    super::transition_event(next),
+                    last_audit_hash_tx(&mut tx, &lease.run.id).await?,
+                )?;
+            update_run_tx(&mut tx, &updated, expected_revision).await?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            let cancel_requested: bool =
+                sqlx::query_scalar("SELECT cancel_requested_at IS NOT NULL FROM runs WHERE id=$1")
+                    .bind(lease.run.id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(super::RunLease {
+                run: updated,
+                cancel_requested,
+                ..lease
+            })
+        })
+    }
+
+    fn complete_leased_run(
+        &self,
+        lease: &super::RunLease,
+        expected_revision: u64,
+        next: RunStatus,
+        reason: Option<&str>,
+        now: UtcTimestamp,
+    ) -> Result<Run, OpenWorkError> {
+        if !matches!(
+            next,
+            RunStatus::Succeeded | RunStatus::Failed | RunStatus::TimedOut
+        ) {
+            return Err(super::state_error(
+                "leased completion must be succeeded, failed, or timed_out",
+            ));
+        }
+        let lease = lease.clone();
+        let reason = reason.map(String::from);
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, expected_revision, now).await?;
+            ensure_audit_time_tx(&mut tx, &lease.run.id, now, current.updated_at).await?;
+            let cancel_requested: bool =
+                sqlx::query_scalar("SELECT cancel_requested_at IS NOT NULL FROM runs WHERE id=$1")
+                    .bind(lease.run.id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+            if next == RunStatus::Succeeded && cancel_requested {
+                return Err(super::state_error(
+                    "cannot complete a cancellation-requested run successfully",
+                ));
+            }
+            let updated = apply_run_transition(&current, next, reason.as_deref(), now)?;
+            let event = AuditAppend::new(lease.owner.clone(), now)
+                .with_run_status(next)
+                .build(
+                    lease.run.id.clone(),
+                    next_audit_sequence_tx(&mut tx, &lease.run.id).await?,
+                    super::transition_event(next),
+                    last_audit_hash_tx(&mut tx, &lease.run.id).await?,
+                )?;
+            update_run_tx(&mut tx, &updated, expected_revision).await?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            let deleted = sqlx::query(
+                "DELETE FROM run_leases WHERE run_id=$1 AND lease_token=$2 AND owner_id=$3",
+            )
+            .bind(lease.run.id.0)
+            .bind(lease.token.0)
+            .bind(lease.owner.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_db)?;
+            if deleted.rows_affected() != 1 {
+                return Err(super::state_error("lease is not current"));
+            }
+            tx.commit().await.map_err(internal_db)?;
+            Ok(updated)
+        })
+    }
+
+    fn request_cancel(
+        &self,
+        run_id: &RunId,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<super::CancelRequest, OpenWorkError> {
+        let run_id = run_id.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &run_id).await?;
+            if current.status.is_terminal() {
+                tx.commit().await.map_err(internal_db)?;
+                return Ok(super::CancelRequest::AlreadyTerminal(current.status));
+            }
+            let has_lease = sqlx::query("SELECT run_id FROM run_leases WHERE run_id=$1 FOR UPDATE")
+                .bind(run_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal_db)?
+                .is_some();
+            if matches!(
+                current.status,
+                RunStatus::Queued | RunStatus::AwaitingApproval
+            ) && !has_lease
+            {
+                ensure_audit_time_tx(&mut tx, &run_id, now, current.updated_at).await?;
+                let updated = apply_run_transition(
+                    &current,
+                    RunStatus::Cancelled,
+                    Some("cancelled before worker claim"),
+                    now,
+                )?;
+                let event = AuditAppend::new(actor, now)
+                    .with_run_status(RunStatus::Cancelled)
+                    .build(
+                        run_id.clone(),
+                        next_audit_sequence_tx(&mut tx, &run_id).await?,
+                        AuditEventType::CancelConfirmed,
+                        last_audit_hash_tx(&mut tx, &run_id).await?,
+                    )?;
+                update_run_tx(&mut tx, &updated, current.revision).await?;
+                insert_audit_event_tx(&mut tx, &event).await?;
+                tx.commit().await.map_err(internal_db)?;
+                return Ok(super::CancelRequest::Cancelled);
+            }
+            if !matches!(
+                current.status,
+                RunStatus::Planning | RunStatus::AwaitingApproval | RunStatus::Running
+            ) {
+                return Err(super::state_error(
+                    "only active runs may request cancellation",
+                ));
+            }
+            if !has_lease {
+                return Err(super::state_error(
+                    "active run has no current worker lease for cancellation",
+                ));
+            }
+            let already: Option<time::OffsetDateTime> =
+                sqlx::query_scalar("SELECT cancel_requested_at FROM runs WHERE id=$1")
+                    .bind(run_id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+            if already.is_some() {
+                tx.commit().await.map_err(internal_db)?;
+                return Ok(super::CancelRequest::Requested);
+            }
+            ensure_audit_time_tx(&mut tx, &run_id, now, current.updated_at).await?;
+            let event = AuditAppend::new(actor, now).build(
+                run_id.clone(),
+                next_audit_sequence_tx(&mut tx, &run_id).await?,
+                AuditEventType::CancelRequested,
+                last_audit_hash_tx(&mut tx, &run_id).await?,
+            )?;
+            sqlx::query("UPDATE runs SET cancel_requested_at=$2 WHERE id=$1")
+                .bind(run_id.0)
+                .bind(now.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_db)?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(super::CancelRequest::Requested)
+        })
+    }
+
+    fn lease_cancel_requested(
+        &self,
+        lease: &super::RunLease,
+        now: UtcTimestamp,
+    ) -> Result<bool, OpenWorkError> {
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let found: Option<bool> = sqlx::query_scalar("SELECT r.cancel_requested_at IS NOT NULL FROM run_leases l JOIN runs r ON r.id=l.run_id WHERE l.run_id=$1 AND l.lease_token=$2 AND l.owner_id=$3 AND l.acquired_at <= $4 AND l.expires_at > $4 AND r.revision=$5 AND r.updated_at <= $4")
+                .bind(lease.run.id.0).bind(lease.token.0).bind(lease.owner.as_str()).bind(now.0).bind(i64::try_from(lease.run.revision).map_err(|_| super::state_error("revision overflow"))?).fetch_optional(&pool).await.map_err(internal_db)?;
+            found.ok_or_else(|| super::state_error("lease is not current"))
+        })
+    }
+
+    fn confirm_cancel(
+        &self,
+        lease: &super::RunLease,
+        now: UtcTimestamp,
+        evidence: super::CancellationEvidence,
+    ) -> Result<Run, OpenWorkError> {
+        if evidence.run_id != lease.run.id
+            || evidence.sandbox_id.is_empty()
+            || evidence.lease_token != lease.token
+            || evidence.lease_owner != lease.owner
+        {
+            return Err(super::state_error(
+                "cancellation evidence does not match lease",
+            ));
+        }
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, lease.run.revision, now).await?;
+            ensure_audit_time_tx(&mut tx, &lease.run.id, now, current.updated_at).await?;
+            let cancel_requested: bool =
+                sqlx::query_scalar("SELECT cancel_requested_at IS NOT NULL FROM runs WHERE id=$1")
+                    .bind(lease.run.id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+            if !cancel_requested {
+                return Err(super::state_error(
+                    "lease is not eligible to confirm cancellation",
+                ));
+            }
+            let updated = apply_run_transition(
+                &current,
+                RunStatus::Cancelled,
+                Some("worker confirmed sandbox termination and cleanup"),
+                now,
+            )?;
+            let event = AuditAppend::new(lease.owner.clone(), now)
+                .with_run_status(RunStatus::Cancelled)
+                .build(
+                    lease.run.id.clone(),
+                    next_audit_sequence_tx(&mut tx, &lease.run.id).await?,
+                    AuditEventType::CancelConfirmed,
+                    last_audit_hash_tx(&mut tx, &lease.run.id).await?,
+                )?;
+            update_run_tx(&mut tx, &updated, current.revision).await?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            let deleted = sqlx::query(
+                "DELETE FROM run_leases WHERE run_id=$1 AND lease_token=$2 AND owner_id=$3",
+            )
+            .bind(lease.run.id.0)
+            .bind(lease.token.0)
+            .bind(lease.owner.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_db)?;
+            if deleted.rows_affected() != 1 {
+                return Err(super::state_error("lease is not current"));
+            }
+            tx.commit().await.map_err(internal_db)?;
+            Ok(updated)
+        })
+    }
+
+    fn recover_expired_leases(
+        &self,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<Vec<RunId>, OpenWorkError> {
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let rows = sqlx::query("SELECT r.id, r.runtime, r.workspace, r.status::text, r.revision, r.actor_id, r.prompt_sha256::text, r.created_at, r.updated_at, r.started_at, r.completed_at, r.terminal_reason FROM runs r JOIN run_leases l ON l.run_id=r.id WHERE l.expires_at <= $1 ORDER BY r.id FOR UPDATE OF r").bind(now.0).fetch_all(&mut *tx).await.map_err(internal_db)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let current = row_to_run(&row)?;
+                ensure_audit_time_tx(&mut tx, &current.id, now, current.updated_at).await?;
+                if !current.status.is_terminal() {
+                    let updated = apply_run_transition(
+                        &current,
+                        RunStatus::Failed,
+                        Some("worker lease expired without durable completion evidence"),
+                        now,
+                    )?;
+                    let event = AuditAppend::new(actor.clone(), now)
+                        .with_run_status(RunStatus::Failed)
+                        .build(
+                            current.id.clone(),
+                            next_audit_sequence_tx(&mut tx, &current.id).await?,
+                            AuditEventType::RunFailed,
+                            last_audit_hash_tx(&mut tx, &current.id).await?,
+                        )?;
+                    update_run_tx(&mut tx, &updated, current.revision).await?;
+                    insert_audit_event_tx(&mut tx, &event).await?;
+                }
+                sqlx::query("DELETE FROM run_leases WHERE run_id=$1")
+                    .bind(current.id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(internal_db)?;
+                ids.push(current.id);
+            }
+            tx.commit().await.map_err(internal_db)?;
+            Ok(ids)
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExecutionStore
 // ---------------------------------------------------------------------------
@@ -208,6 +625,16 @@ impl super::ExecutionStore for PostgresExecutionStore {
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
             let current = lock_run_tx(&mut tx, &run_id).await?;
+            let leased = sqlx::query("SELECT run_id FROM run_leases WHERE run_id=$1 FOR UPDATE")
+                .bind(run_id.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(internal_db)?;
+            if leased.is_some() {
+                return Err(super::state_error(
+                    "leased runs must use a lease-capability-bound transition",
+                ));
+            }
             if current.revision != expected_revision || !current.status.can_transition_to(next) {
                 return Err(super::state_error(
                     "run revision is stale or transition is illegal",
@@ -998,6 +1425,44 @@ async fn lock_run_tx(
     row_to_run(&row)
 }
 
+/// Locks the lease after its run row has already been locked, preserving the
+/// global `runs -> run_leases` lock order used by every worker operation.
+async fn validate_current_lease_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    lease: &super::RunLease,
+    current: &Run,
+    expected_revision: u64,
+    now: UtcTimestamp,
+) -> Result<(), OpenWorkError> {
+    if lease.run.revision != expected_revision || current.revision != expected_revision {
+        return Err(super::state_error("run revision is stale"));
+    }
+    let row = sqlx::query(
+        "SELECT lease_token, owner_id, acquired_at, expires_at
+         FROM run_leases WHERE run_id=$1 FOR UPDATE",
+    )
+    .bind(lease.run.id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal_db)?
+    .ok_or_else(|| super::state_error("lease does not exist"))?;
+    let token: Uuid = row.get("lease_token");
+    let owner: String = row.get("owner_id");
+    let acquired_at = UtcTimestamp(row.get::<time::OffsetDateTime, _>("acquired_at"));
+    let expires_at = UtcTimestamp(row.get::<time::OffsetDateTime, _>("expires_at"));
+    if token != lease.token.0
+        || owner != lease.owner.as_str()
+        || now < acquired_at
+        || now >= expires_at
+        || now < current.updated_at
+    {
+        return Err(super::state_error(
+            "lease capability, revision, or time is not current",
+        ));
+    }
+    Ok(())
+}
+
 async fn insert_run_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run: &Run,
@@ -1138,6 +1603,22 @@ async fn last_audit_timestamp_tx(
     .await
     .map_err(internal_db)?;
     Ok(ts.map(UtcTimestamp))
+}
+
+async fn ensure_audit_time_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &RunId,
+    timestamp: UtcTimestamp,
+    updated_at: UtcTimestamp,
+) -> Result<(), OpenWorkError> {
+    if timestamp < updated_at
+        || last_audit_timestamp_tx(tx, run_id)
+            .await?
+            .is_some_and(|last| timestamp < last)
+    {
+        return Err(super::state_error("audit timestamps cannot move backwards"));
+    }
+    Ok(())
 }
 
 async fn next_audit_sequence_tx(
@@ -1471,6 +1952,8 @@ fn parse_audit_event_type(s: &str) -> Result<AuditEventType, OpenWorkError> {
         "run_completed" => Ok(AuditEventType::RunCompleted),
         "run_failed" => Ok(AuditEventType::RunFailed),
         "approval_binding_mismatch" => Ok(AuditEventType::ApprovalBindingMismatch),
+        "cancel_requested" => Ok(AuditEventType::CancelRequested),
+        "cancel_confirmed" => Ok(AuditEventType::CancelConfirmed),
         _ => Err(super::internal_error("unknown audit event type")),
     }
 }
