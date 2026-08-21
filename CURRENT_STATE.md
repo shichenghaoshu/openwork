@@ -1,7 +1,7 @@
 # OpenWork current state
 
 This document is the single status source for the repository. Claims below are
-scoped by evidence level and were last refreshed on 2026-08-21.
+scoped by evidence level and were last refreshed on 2026-08-22.
 
 ## Working
 
@@ -22,11 +22,17 @@ scoped by evidence level and were last refreshed on 2026-08-21.
   persists runs, approvals, single-use action claims, artifacts, and hash-chain
   audit events with CAS revisions and transactional state changes.
 - The authenticated Control API persists run creation, reads runs/events/
-  artifacts/approvals, and performs approval or denial with trusted server time
-  and actor identity. Cancellation remains deliberately unavailable until a
-  durable worker can prove that the runtime and sandbox stopped.
-- Startup recovery deterministically transitions persisted `Planning` and
-  `Running` runs to `Failed` with an audit event. M1 has no `Cancelling` state.
+  artifacts/approvals, and performs approval, denial, and cancellation requests
+  with trusted server time and actor identity. Unleased queued or
+  awaiting-approval runs cancel immediately; active work records an intent and
+  returns `202` without claiming a terminal state.
+- The execution store provides database-mediated worker leases with random
+  capability tokens, bounded heartbeats, deterministic claim ordering, and
+  fail-closed expiry. Only a current lease plus a validated cancelled sandbox
+  result and successful cleanup can confirm terminal `Cancelled`.
+- Startup recovery fails expired leases and unleased orphaned `Planning` or
+  `Running` runs while preserving valid leases. M1 has no `Cancelling` state;
+  the durable cancellation intent is separate from the public run status.
 - Policy tests cover automatic filesystem read/write, exact-bound L3
   `email.send` approval, single-use claim consumption, replay and parameter
   tampering rejection, and direct L4 `database.delete` denial.
@@ -49,8 +55,8 @@ scoped by evidence level and were last refreshed on 2026-08-21.
   orchestrator terminal states, Control API fail-closed behavior, and the M1
   control-plane scenario.
 - Real-Postgres tests exercise approve-versus-deny, consume-versus-consume,
-  cancel-versus-complete, revision races, and selective/idempotent crash
-  recovery.
+  cancel-versus-complete, queue claim ownership, cancellation confirmation,
+  lease expiry, revision races, and selective/idempotent crash recovery.
 - CI includes a real Docker daemon sales test and a real Postgres concurrency
   job. Compose CI builds and starts the deployed services, checks health,
   creates an authenticated run, verifies prompt omission, and reads its genesis
@@ -63,12 +69,11 @@ scoped by evidence level and were last refreshed on 2026-08-21.
 - macOS arm64 with Docker Server 29.2.0: the digest-pinned BusyBox sales
   container completed, produced byte-identical CSV/Markdown artifacts, passed
   artifact hashing and audit verification, and cleaned up.
-- macOS arm64 with a real PostgreSQL 17.6 container: all five transaction-race
-  and recovery tests passed.
-- macOS arm64 Compose: migrations 1 through 3 applied; Postgres and the Control
-  API became healthy; an authenticated queued run persisted; its response did
-  not contain the prompt; its `run_created` audit event round-tripped and
-  verified from Postgres.
+- macOS arm64 with a real PostgreSQL 17.6 container: all ten transaction-race,
+  queue-lease, cancellation, expiry, and recovery tests passed.
+- macOS arm64 Compose: migrations 1 through 4 applied; Postgres and the Control
+  API became healthy; an authenticated queued run persisted without returning
+  its prompt, then cancelled immediately with `cancel_confirmed` audit evidence.
 - `scripts/demo-m1.sh` completed Doctor, the real-container sales demo, and both
   policy/approval/action control-plane scenarios without sending external
   email.
@@ -76,8 +81,10 @@ scoped by evidence level and were last refreshed on 2026-08-21.
 ## Fixture only
 
 - Claude Code and Codex adapter commands, stdin routing, and provider event
-  decoders are fixture-tested. No credential-gated provider task has completed
-  inside the production sandbox image.
+  decoders are fixture-tested. A default-ignored, explicit-auth `HostOnly`
+  harness can exercise a locally installed provider CLI with bounded output and
+  a cleared environment, but no real provider task was invoked during this
+  checkpoint and this is not production-sandbox evidence.
 - Podman command routing and hardened-argument equivalence are fixture-tested;
   no real Podman host lifecycle has been run.
 - Tier-1 macOS x64, Linux x64/arm64, and Windows Server 2025 x64 compatibility
@@ -90,12 +97,14 @@ scoped by evidence level and were last refreshed on 2026-08-21.
 
 - A durable worker/dispatcher that claims queued Control API runs and drives
   the generic `RuntimeTask -> adapter -> sandbox -> events -> artifacts ->
-  terminal state` path. Until it exists, `openwork run` fails clearly and does
-  not create a misleading queued run.
+  terminal state` path. Lease and cancellation repositories now exist, but no
+  production worker calls them. Until it does, `openwork run` fails clearly and
+  does not create a misleading queued run.
 - End-to-end cancellation from `POST /v1/runs/:id/cancel` through a durable
-  worker to runtime and sandbox termination. The route currently returns 503.
-- A credential-gated real Claude Code or Codex execution image and optional
-  provider E2E job.
+  worker to runtime and sandbox termination. The route safely persists active
+  cancellation intent, but no production worker yet polls and confirms it.
+- A credential-gated real Claude Code or Codex execution image and an actual
+  provider run. The checked-in host probe is optional and was not invoked.
 - Real Podman host validation and durable production idempotency for a real
   external-action executor.
 - The thin employee/admin web UI, intentionally deferred to M1.1.
@@ -103,8 +112,9 @@ scoped by evidence level and were last refreshed on 2026-08-21.
 ## Blockers
 
 - The deterministic M1 demo is repeatable, but the generic API/CLI execution
-  product is not production-ready until queued runs have an owned durable
-  worker and cancellation protocol.
+  product is not production-ready until queued runs have an owned worker and a
+  secure input-delivery boundary. Prompts are deliberately not persisted in
+  plaintext, so a worker must not be connected by weakening that invariant.
 - Enterprise pilot readiness additionally requires provider-image provenance,
   real provider validation, operational credential brokering, deployment
   observability, backup/restore, and an external security review.

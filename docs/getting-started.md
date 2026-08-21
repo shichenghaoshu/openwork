@@ -29,6 +29,27 @@ absolute directory. No email is sent.
 See [CURRENT_STATE.md](../CURRENT_STATE.md) before treating this demo as proof
 of a generic queued-run worker or real Claude Code/Codex provider execution.
 
+## Optional real-provider host probe
+
+An ignored `HostOnly` test can validate a locally authenticated Claude Code or
+Codex CLI without making provider access part of normal CI. It is not container
+sandbox evidence and may consume provider quota or make provider network calls,
+so run it only with explicit authorization:
+
+```bash
+OPENWORK_REAL_RUNTIME_TESTS=1 \
+OPENWORK_REAL_RUNTIME_AUTH=1 \
+OPENWORK_REAL_RUNTIME_PROVIDER=codex \
+OPENWORK_REAL_RUNTIME_BIN=/absolute/path/to/codex \
+cargo test -p openwork-e2e --test real_provider_runtime --locked -- --ignored --nocapture
+```
+
+Use `claude-code` and the absolute Claude executable for the other adapter.
+Authenticate the selected CLI through its supported mechanism before opting in;
+do not place credentials in this command. The harness clears the inherited
+environment except for a minimal platform/authentication allowlist, supplies the
+prompt on stdin, bounds captured output, and enforces a timeout.
+
 ## Bootstrap CLI commands
 
 ```bash

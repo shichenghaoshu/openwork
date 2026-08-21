@@ -9,8 +9,9 @@
 [为客户部署](docs/deploy-for-client.md) · [开发 Capability Pack](docs/packs/build-your-first-pack.md)
 
 > 当前状态：M1 完成工作正在集成。真实容器销售演示、Postgres 控制状态、
-> 策略/审批/动作控制、产物与哈希链审计已实现；通用持久化 run worker 与 cancel
-> 链路仍缺失。证据分级见[当前状态](CURRENT_STATE.md)。
+> 策略/审批/动作控制、产物与哈希链审计已实现；持久化 worker 租约与 fail-closed
+> 取消意图已实现，通用 worker 执行循环及安全 prompt 交付仍缺失。证据分级见
+> [当前状态](CURRENT_STATE.md)。
 
 ## 员工未来可以完成
 

@@ -10,8 +10,10 @@ business tools, and safe execution.
 
 > Status: the M1 completion work is under integration. A real-container sales
 > demo, Postgres control state, policy/approval/action controls, artifacts, and
-> hash-chain audit are implemented; the generic durable run worker and cancel
-> path are still missing. See the evidence-scoped [current state](CURRENT_STATE.md).
+> hash-chain audit are implemented. Durable worker leases and fail-closed
+> cancellation intent are implemented; the generic worker execution loop and
+> secure prompt delivery are still missing. See the evidence-scoped
+> [current state](CURRENT_STATE.md).
 
 ## What employees will be able to do
 
