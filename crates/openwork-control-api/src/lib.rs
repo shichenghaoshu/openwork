@@ -8,13 +8,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use openwork_core::ErrorCode;
 use openwork_execution::{
     ActorId, ApprovalDecision, ApprovalId, ApprovalRequest, DEFAULT_MAX_ARTIFACT_BYTES, Run, RunId,
     UtcTimestamp,
     approval::ApprovalRepository,
     artifact::ArtifactScanner,
     orchestrator::ExecutionOrchestrator,
-    store::{ExecutionStore, postgres::PostgresExecutionStore},
+    store::{CancelRequest, ExecutionStore, RunQueueRepository, postgres::PostgresExecutionStore},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -115,6 +116,69 @@ struct AppState {
     token_hash: [u8; 32],
     actor_id: String,
     workspace_root: PathBuf,
+    cancellation: Arc<dyn CancellationCoordinator>,
+}
+
+/// Boundary between HTTP cancellation intent and the durable execution worker.
+///
+/// The adapter persists an active-run cancellation request but only a worker
+/// with a current lease may later confirm the terminal state after runtime and
+/// sandbox cleanup evidence has been verified.
+trait CancellationCoordinator: Send + Sync {
+    fn request_cancel(
+        &self,
+        run_id: &RunId,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<CancellationOutcome, CancellationError>;
+}
+
+#[derive(Clone, Copy)]
+enum CancellationOutcome {
+    Cancelled,
+    Accepted,
+    AlreadyCancelled,
+    TerminalConflict,
+}
+
+#[derive(Clone, Copy)]
+enum CancellationError {
+    NotFound,
+    Conflict,
+    Internal,
+}
+
+#[derive(Clone)]
+struct DurableCancellationCoordinator {
+    store: PostgresExecutionStore,
+}
+
+impl CancellationCoordinator for DurableCancellationCoordinator {
+    fn request_cancel(
+        &self,
+        run_id: &RunId,
+        actor: ActorId,
+        now: UtcTimestamp,
+    ) -> Result<CancellationOutcome, CancellationError> {
+        self.store
+            .get_run(run_id)
+            .map_err(|_| CancellationError::Internal)?
+            .ok_or(CancellationError::NotFound)?;
+        match self
+            .store
+            .request_cancel(run_id, actor, now)
+            .map_err(|error| match error.code {
+                ErrorCode::InvalidStateTransition => CancellationError::Conflict,
+                _ => CancellationError::Internal,
+            })? {
+            CancelRequest::Cancelled => Ok(CancellationOutcome::Cancelled),
+            CancelRequest::Requested => Ok(CancellationOutcome::Accepted),
+            CancelRequest::AlreadyTerminal(openwork_execution::RunStatus::Cancelled) => {
+                Ok(CancellationOutcome::AlreadyCancelled)
+            }
+            CancelRequest::AlreadyTerminal(_) => Ok(CancellationOutcome::TerminalConflict),
+        }
+    }
 }
 
 /// Runs migrations and serves the Control API.
@@ -130,8 +194,10 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     MIGRATIONS.run(&pool).await?;
     let recovery_actor = ActorId::parse(config.actor_id.clone())?;
-    PostgresExecutionStore::new(pool.clone())
-        .recover_interrupted_runs(recovery_actor, UtcTimestamp::now())?;
+    let store = PostgresExecutionStore::new(pool.clone());
+    let recovery_time = UtcTimestamp::now();
+    store.recover_expired_leases(recovery_actor.clone(), recovery_time)?;
+    store.recover_interrupted_runs(recovery_actor, recovery_time)?;
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     axum::serve(
         listener,
@@ -151,12 +217,26 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 /// `workspace_root` must already be canonical. Production callers should use
 /// [`Config::from_env`], which enforces that invariant.
 pub fn router(pool: PgPool, api_token: &str, actor_id: String, workspace_root: PathBuf) -> Router {
+    let cancellation = Arc::new(DurableCancellationCoordinator {
+        store: PostgresExecutionStore::new(pool.clone()),
+    });
+    router_with_cancellation(pool, api_token, actor_id, workspace_root, cancellation)
+}
+
+fn router_with_cancellation(
+    pool: PgPool,
+    api_token: &str,
+    actor_id: String,
+    workspace_root: PathBuf,
+    cancellation: Arc<dyn CancellationCoordinator>,
+) -> Router {
     let state = Arc::new(AppState {
         store: PostgresExecutionStore::new(pool.clone()),
         pool,
         token_hash: Sha256::digest(api_token.as_bytes()).into(),
         actor_id,
         workspace_root,
+        cancellation,
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -316,12 +396,33 @@ async fn get_run(
 }
 
 async fn cancel_run(
-    Extension(_actor): Extension<AuthActor>,
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<AuthActor>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
-    let _id = validate_execution_id(id)?;
-    // Never claim cancellation until the orchestrator has stopped runtime and sandbox.
-    Err(ApiError::unavailable("run_cancellation_unavailable"))
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = validate_execution_id(id)?;
+    let run_id =
+        RunId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))?;
+    let actor = ActorId::parse(actor.0).map_err(|_| ApiError::internal())?;
+    match state
+        .cancellation
+        .request_cancel(&run_id, actor, UtcTimestamp::now())
+    {
+        Ok(CancellationOutcome::Cancelled | CancellationOutcome::AlreadyCancelled) => Ok((
+            StatusCode::OK,
+            Json(json!({"status":"cancelled", "confirmed":true})),
+        )),
+        Ok(CancellationOutcome::Accepted) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"status":"cancelling", "confirmed":false})),
+        )),
+        Ok(CancellationOutcome::TerminalConflict) => {
+            Err(ApiError::conflict("run_already_terminal"))
+        }
+        Err(CancellationError::NotFound) => Err(ApiError::not_found("run_not_found")),
+        Err(CancellationError::Conflict) => Err(ApiError::conflict("run_cancellation_conflict")),
+        Err(CancellationError::Internal) => Err(ApiError::internal()),
+    }
 }
 
 async fn list_artifacts(
@@ -493,9 +594,6 @@ impl ApiError {
     const fn conflict(code: &'static str) -> Self {
         Self(StatusCode::CONFLICT, code)
     }
-    const fn unavailable(code: &'static str) -> Self {
-        Self(StatusCode::SERVICE_UNAVAILABLE, code)
-    }
     const fn internal() -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     }
@@ -529,6 +627,32 @@ mod tests {
             .connect_lazy("postgres://openwork:openwork@127.0.0.1:9/openwork")
             .expect("valid test database URL");
         router(pool, TOKEN, "test:control".to_owned(), root)
+    }
+
+    struct AcceptedCancellation;
+
+    impl CancellationCoordinator for AcceptedCancellation {
+        fn request_cancel(
+            &self,
+            _run_id: &RunId,
+            _actor: ActorId,
+            _now: UtcTimestamp,
+        ) -> Result<CancellationOutcome, CancellationError> {
+            Ok(CancellationOutcome::Accepted)
+        }
+    }
+
+    fn accepted_cancellation_router(root: PathBuf) -> Router {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://openwork:openwork@127.0.0.1:9/openwork")
+            .expect("valid test database URL");
+        router_with_cancellation(
+            pool,
+            TOKEN,
+            "test:control".to_owned(),
+            root,
+            Arc::new(AcceptedCancellation),
+        )
     }
 
     fn request(method: Method, uri: &str, body: &str, authenticated: bool) -> Request<Body> {
@@ -568,9 +692,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_fails_closed_until_runtime_cancellation_is_integrated() {
+    async fn active_cancellation_returns_intent_not_a_false_terminal_claim() {
         let run_id = Uuid::now_v7();
-        let response = test_router(PathBuf::from("."))
+        let response = accepted_cancellation_router(PathBuf::from("."))
             .oneshot(request(
                 Method::POST,
                 &format!("/v1/runs/{run_id}/cancel"),
@@ -579,7 +703,7 @@ mod tests {
             ))
             .await
             .expect("router response");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

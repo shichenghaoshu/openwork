@@ -1556,6 +1556,7 @@ name = "openwork-control-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "openwork-core",
  "openwork-execution",
  "serde",
  "serde_json",
