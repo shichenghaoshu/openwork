@@ -4,9 +4,9 @@ use openwork_execution::store::{
     RunLease, RunQueueRepository,
 };
 use openwork_execution::{
-    ActorId, Artifact, ArtifactId, ArtifactSizeBytes, AuditEventType, EXECUTION_SCHEMA_VERSION,
-    RelativeArtifactPath, Run, RunId, RunStatus, SandboxCleanupStatus, SandboxResult,
-    SandboxTermination, UtcTimestamp, sha256_bytes,
+    ActionId, ActorId, Artifact, ArtifactId, ArtifactSizeBytes, AuditEventType,
+    EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, Run, RunId, RunStatus, SandboxCleanupStatus,
+    SandboxResult, SandboxTermination, UtcTimestamp, sha256_bytes,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -122,6 +122,97 @@ fn expired_lease_fails_closed_without_requeue() {
             .expect("claim")
             .is_none()
     );
+}
+
+#[test]
+fn leased_worker_writes_require_capability_and_preserve_atomic_artifacts() {
+    let store = InMemoryExecutionStore::default();
+    let run = queued_run();
+    store
+        .create_run(run.clone(), audit("2026-08-10T00:00:00Z"))
+        .expect("create");
+    let lease = store
+        .claim_next_run(
+            ActorId::parse("worker:leased").expect("worker"),
+            timestamp("2026-08-10T00:00:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    let now = timestamp("2026-08-10T00:00:02Z");
+
+    assert!(
+        store
+            .append_audit(
+                &run.id,
+                AuditEventType::RuntimeOutput,
+                AuditAppend::new(actor(), now)
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .record_artifacts(
+                &run.id,
+                vec![artifact(&run.id, "report.txt")],
+                audit("2026-08-10T00:00:02Z")
+            )
+            .is_err()
+    );
+    let receipt = openwork_execution::action_executor::ActionExecutionReceipt {
+        run_id: run.id.clone(),
+        action_id: ActionId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a12").expect("id"),
+        parameter_hash: sha256_bytes(b"parameters"),
+    };
+    assert!(
+        store
+            .reconcile_action_execution(&receipt, audit("2026-08-10T00:00:02Z"))
+            .is_err()
+    );
+
+    let event = store
+        .append_leased_runtime_audit(
+            &lease,
+            lease.run.revision,
+            AuditEventType::RuntimeStarted,
+            now,
+        )
+        .expect("lease-bound runtime audit");
+    assert_eq!(event.actor, lease.owner);
+    assert!(
+        store
+            .append_leased_runtime_audit(
+                &lease,
+                lease.run.revision,
+                AuditEventType::PolicyAllowed,
+                timestamp("2026-08-10T00:00:03Z"),
+            )
+            .is_err()
+    );
+
+    let first = artifact(&run.id, "report.txt");
+    let duplicate = artifact(&run.id, "report.txt");
+    assert!(
+        store
+            .record_leased_artifacts(
+                &lease,
+                lease.run.revision,
+                vec![first, duplicate],
+                timestamp("2026-08-10T00:00:03Z"),
+            )
+            .is_err()
+    );
+    assert!(store.artifacts(&run.id).expect("read artifacts").is_empty());
+    store
+        .record_leased_artifacts(
+            &lease,
+            lease.run.revision,
+            vec![artifact(&run.id, "report.txt")],
+            timestamp("2026-08-10T00:00:03Z"),
+        )
+        .expect("atomic leased artifact batch");
+    let events = store.audit_events(&run.id).expect("events");
+    assert_eq!(events.last().expect("artifact event").actor, lease.owner);
 }
 
 #[test]
@@ -505,6 +596,19 @@ fn queued_run() -> Run {
 
 fn audit(value: &str) -> AuditAppend {
     AuditAppend::new(actor(), timestamp(value))
+}
+
+fn artifact(run_id: &RunId, path: &str) -> Artifact {
+    Artifact {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: ArtifactId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a11").expect("UUIDv7"),
+        run_id: run_id.clone(),
+        path: RelativeArtifactPath::parse(path).expect("path"),
+        media_type: "text/plain".to_owned(),
+        size_bytes: ArtifactSizeBytes::new(4).expect("size"),
+        sha256: sha256_bytes(b"data"),
+        created_at: timestamp("2026-08-10T00:00:03Z"),
+    }
 }
 
 fn actor() -> ActorId {

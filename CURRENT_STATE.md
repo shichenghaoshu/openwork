@@ -33,6 +33,14 @@ scoped by evidence level and were last refreshed on 2026-08-22.
 - Startup recovery fails expired leases and unleased orphaned `Planning` or
   `Running` runs while preserving valid leases. M1 has no `Cancelling` state;
   the durable cancellation intent is separate from the public run status.
+- The in-process worker claims queued runs, retrieves a digest-bound one-time
+  prompt, drives the configured adapter and container sandbox, heartbeats its
+  lease, observes cancellation intent, records bounded runtime/artifact audit,
+  and completes through lease-bound repository methods. Missing prompts after
+  restart fail closed instead of being persisted in plaintext.
+- An enabled provider worker requires an explicitly named, operator-provisioned
+  container network; it never falls back to Docker default or host networking.
+  Deployments must enforce provider-only egress on that dedicated network.
 - Policy tests cover automatic filesystem read/write, exact-bound L3
   `email.send` approval, single-use claim consumption, replay and parameter
   tampering rejection, and direct L4 `database.delete` denial.
@@ -45,6 +53,12 @@ scoped by evidence level and were last refreshed on 2026-08-22.
 - Compose starts a non-root, read-only Control API with a read-only workspace
   mount and a digest-pinned Postgres service. The service runs migrations and
   recovery before listening.
+- Employee Workspace provides task creation/polling/cancellation, approval
+  decisions, and connector discovery through a fixed Electron IPC allowlist;
+  the renderer never receives the Control API token.
+- The Control API owns read-only GitHub and Feishu/Lark MCP discovery. It
+  returns redacted tool metadata and schema digests, caches successful probes
+  for 60 seconds, and does not expose a `tools/call` route.
 
 ## Tested
 
@@ -77,6 +91,8 @@ scoped by evidence level and were last refreshed on 2026-08-22.
 - `scripts/demo-m1.sh` completed Doctor, the real-container sales demo, and both
   policy/approval/action control-plane scenarios without sending external
   email.
+- The official digest-pinned GitHub MCP Server completed a real stdio MCP
+  initialize and read-only `tools/list` through the OpenWork connector client.
 
 ## Fixture only
 
@@ -92,29 +108,24 @@ scoped by evidence level and were last refreshed on 2026-08-22.
   distributions.
 - The external-action path ends at `MockActionExecutor`; no email, ERP, CRM, or
   other connector is enabled.
+- Feishu/Lark MCP startup and its exact read-only tool allowlist are wired, but
+  no tenant credentials were available for a real account probe.
 
 ## Missing
 
-- A durable worker/dispatcher that claims queued Control API runs and drives
-  the generic `RuntimeTask -> adapter -> sandbox -> events -> artifacts ->
-  terminal state` path. Lease and cancellation repositories now exist, but no
-  production worker calls them. Until it does, `openwork run` fails clearly and
-  does not create a misleading queued run.
-- End-to-end cancellation from `POST /v1/runs/:id/cancel` through a durable
-  worker to runtime and sandbox termination. The route safely persists active
-  cancellation intent, but no production worker yet polls and confirms it.
 - A credential-gated real Claude Code or Codex execution image and an actual
   provider run. The checked-in host probe is optional and was not invoked.
 - Real Podman host validation and durable production idempotency for a real
   external-action executor.
-- The thin employee/admin web UI, intentionally deferred to M1.1.
+- Governed MCP `tools/call`: exact ActionClaim consumption, scoped credential
+  brokering, bounded result redaction, and connector audit are still required
+  before any runtime may invoke GitHub or Feishu actions.
+- Durable encrypted prompt recovery. The current one-time prompt handoff is
+  process-local and intentionally fails queued work after a control-plane
+  restart.
 
 ## Blockers
 
-- The deterministic M1 demo is repeatable, but the generic API/CLI execution
-  product is not production-ready until queued runs have an owned worker and a
-  secure input-delivery boundary. Prompts are deliberately not persisted in
-  plaintext, so a worker must not be connected by weakening that invariant.
 - Enterprise pilot readiness additionally requires provider-image provenance,
-  real provider validation, operational credential brokering, deployment
-  observability, backup/restore, and an external security review.
+  real provider and Feishu tenant validation, operational credential brokering,
+  deployment observability, backup/restore, and an external security review.

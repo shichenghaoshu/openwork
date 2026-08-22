@@ -47,7 +47,7 @@ pub trait ContainerEngine: private::Sealed + Copy + Send + Sync {
     fn remove_failure_code(self) -> &'static str;
 
     fn create_arguments(self) -> Vec<OsString> {
-        args(["create", "--network", "none", "--read-only"])
+        args(["create", "--read-only"])
     }
 
     fn start_arguments(self, container_id: &str) -> Vec<OsString> {

@@ -1,7 +1,8 @@
 use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::{
     ApprovedMountDirectory, DigestPinnedImageRef, RunId, SandboxBackend, SandboxCleanupStatus,
-    SandboxCommand, SandboxLimits, SandboxRequest, SandboxTermination, SandboxUser,
+    SandboxCommand, SandboxLimits, SandboxNetworkName, SandboxNetworkPolicy, SandboxRequest,
+    SandboxTermination, SandboxUser,
 };
 use openwork_sandbox::{
     CapabilitySupport, CliOutput, ContainerEngineHealth, ContainerEngineKind, DockerCli,
@@ -370,6 +371,25 @@ fn lifecycle_uses_hardened_create_then_id_only_cleanup() {
         !temporary.exists(),
         "backend temporary directory must be removed"
     );
+}
+
+#[test]
+fn restricted_provider_network_is_forwarded_without_host_network_access() {
+    let mut fixture = fixture(2, 1024);
+    fixture.request.network = SandboxNetworkPolicy::Restricted(
+        SandboxNetworkName::parse("openwork-provider-egress").expect("network"),
+    );
+    let cli = Arc::new(FakeDockerCli::successful());
+    let backend = DockerSandbox::new(Arc::clone(&cli), fixture.temporary.clone())
+        .with_poll_interval(Duration::ZERO);
+    backend.execute(&fixture.request).expect("sandbox result");
+    let create = &cli.commands()[0];
+    assert!(
+        create
+            .windows(2)
+            .any(|pair| pair == ["--network", "openwork-provider-egress"])
+    );
+    assert!(!create.iter().any(|argument| argument == "host"));
 }
 
 #[test]

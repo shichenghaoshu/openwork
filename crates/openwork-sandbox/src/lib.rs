@@ -14,8 +14,8 @@ pub use engine::{
 use filesystem::{OwnedTemporaryDirectory, collect_output_paths, mount_argument, validate_mount};
 use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::{
-    EXECUTION_SCHEMA_VERSION, RunId, SandboxBackend, SandboxCleanupStatus, SandboxRequest,
-    SandboxResult, SandboxTermination, UtcTimestamp,
+    EXECUTION_SCHEMA_VERSION, RunId, SandboxBackend, SandboxCleanupStatus, SandboxNetworkPolicy,
+    SandboxRequest, SandboxResult, SandboxTermination, UtcTimestamp,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -520,6 +520,12 @@ fn create_arguments<E: ContainerEngine>(
     environment_file: PathBuf,
 ) -> Result<Vec<OsString>, OpenWorkError> {
     let mut args = engine.create_arguments();
+    match &request.network {
+        SandboxNetworkPolicy::Disabled => push_pair(&mut args, "--network", "none"),
+        SandboxNetworkPolicy::Restricted(network) => {
+            push_pair(&mut args, "--network", network.as_str());
+        }
+    }
     push_pair(&mut args, "--cap-drop", "ALL");
     push_pair(&mut args, "--security-opt", "no-new-privileges");
     push_pair(

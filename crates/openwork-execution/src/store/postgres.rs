@@ -369,6 +369,106 @@ impl super::RunQueueRepository for PostgresExecutionStore {
         })
     }
 
+    fn append_leased_runtime_audit(
+        &self,
+        lease: &super::RunLease,
+        expected_revision: u64,
+        event_type: AuditEventType,
+        now: UtcTimestamp,
+    ) -> Result<AuditEvent, OpenWorkError> {
+        super::ensure_worker_runtime_event(event_type)?;
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, expected_revision, now).await?;
+            ensure_audit_time_tx(&mut tx, &lease.run.id, now, current.updated_at).await?;
+            let event = AuditAppend::new(lease.owner.clone(), now).build(
+                lease.run.id.clone(),
+                next_audit_sequence_tx(&mut tx, &lease.run.id).await?,
+                event_type,
+                last_audit_hash_tx(&mut tx, &lease.run.id).await?,
+            )?;
+            insert_audit_event_tx(&mut tx, &event).await?;
+            tx.commit().await.map_err(internal_db)?;
+            Ok(event)
+        })
+    }
+
+    fn record_leased_artifacts(
+        &self,
+        lease: &super::RunLease,
+        expected_revision: u64,
+        artifacts: Vec<Artifact>,
+        now: UtcTimestamp,
+    ) -> Result<(), OpenWorkError> {
+        let artifacts = artifacts
+            .into_iter()
+            .map(postgres_artifact)
+            .collect::<Vec<_>>();
+        validate_postgres_artifact_batch(&lease.run.id, &artifacts)?;
+        let lease = lease.clone();
+        let now = postgres_timestamp(now);
+        let pool = self.pool.clone();
+        block_on(async move {
+            let mut tx = pool.begin().await.map_err(internal_db)?;
+            let current = lock_run_tx(&mut tx, &lease.run.id).await?;
+            validate_current_lease_tx(&mut tx, &lease, &current, expected_revision, now).await?;
+            for artifact in &artifacts {
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM artifacts WHERE run_id = $1 AND path = $2)",
+                )
+                .bind(lease.run.id.0)
+                .bind(artifact.path.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(internal_db)?;
+                if exists {
+                    return Err(OpenWorkError::new(
+                        ErrorCode::ArtifactInvalid,
+                        "duplicate artifact path",
+                    ));
+                }
+            }
+            ensure_audit_time_tx(&mut tx, &lease.run.id, now, current.updated_at).await?;
+            let mut previous = last_audit_hash_tx(&mut tx, &lease.run.id).await?;
+            let mut sequence = next_audit_sequence_tx(&mut tx, &lease.run.id).await?;
+            for artifact in &artifacts {
+                sqlx::query(
+                    "INSERT INTO artifacts (id, run_id, path, media_type, size_bytes, sha256, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(artifact.id.0)
+                .bind(lease.run.id.0)
+                .bind(artifact.path.as_str())
+                .bind(&artifact.media_type)
+                .bind(i64::try_from(artifact.size_bytes.get()).unwrap_or(i64::MAX))
+                .bind(artifact.sha256.as_str())
+                .bind(artifact.created_at.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_db)?;
+                let event = AuditAppend::new(lease.owner.clone(), now)
+                    .with_artifact(artifact)
+                    .build(
+                        lease.run.id.clone(),
+                        sequence,
+                        AuditEventType::ArtifactCreated,
+                        previous,
+                    )?;
+                previous = Some(event.event_hash().clone());
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| super::internal_error("audit sequence overflow"))?;
+                insert_audit_event_tx(&mut tx, &event).await?;
+            }
+            tx.commit().await.map_err(internal_db)?;
+            Ok(())
+        })
+    }
+
     fn request_cancel(
         &self,
         run_id: &RunId,
@@ -677,6 +777,7 @@ impl super::ExecutionStore for PostgresExecutionStore {
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
             let _run = lock_run_tx(&mut tx, &run_id).await?;
+            reject_unbound_leased_write_tx(&mut tx, &run_id).await?;
             let last_audit_ts = last_audit_timestamp_tx(&mut tx, &run_id).await?;
             if last_audit_ts.is_some_and(|ts| audit.timestamp < ts) {
                 return Err(super::state_error("audit timestamps cannot move backwards"));
@@ -701,6 +802,7 @@ impl super::ExecutionStore for PostgresExecutionStore {
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
             let _run = lock_run_tx(&mut tx, &receipt.run_id).await?;
+            reject_unbound_leased_write_tx(&mut tx, &receipt.run_id).await?;
             let claim = sqlx::query(
                 "SELECT run_id, parameter_hash::text
                  FROM action_claims WHERE action_id = $1",
@@ -817,6 +919,7 @@ impl super::ExecutionStore for PostgresExecutionStore {
         block_on(async move {
             let mut tx = pool.begin().await.map_err(internal_db)?;
             let _run = lock_run_tx(&mut tx, &run_id).await?;
+            reject_unbound_leased_write_tx(&mut tx, &run_id).await?;
             for artifact in &artifacts {
                 let exists = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM artifacts WHERE run_id = $1 AND path = $2)",
@@ -1458,6 +1561,59 @@ async fn validate_current_lease_tx(
     {
         return Err(super::state_error(
             "lease capability, revision, or time is not current",
+        ));
+    }
+    Ok(())
+}
+
+/// Called only after [`lock_run_tx`], so ordinary execution-store writes cannot
+/// overtake an active worker capability or invert the `runs -> run_leases`
+/// locking order.
+async fn reject_unbound_leased_write_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &RunId,
+) -> Result<(), OpenWorkError> {
+    let leased = sqlx::query("SELECT run_id FROM run_leases WHERE run_id=$1 FOR UPDATE")
+        .bind(run_id.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal_db)?;
+    if leased.is_some() {
+        return Err(super::state_error(
+            "leased runs must use a lease-capability-bound worker write",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_postgres_artifact_batch(
+    run_id: &RunId,
+    artifacts: &[Artifact],
+) -> Result<(), OpenWorkError> {
+    if artifacts.iter().any(|artifact| &artifact.run_id != run_id) {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "artifact run mismatch",
+        ));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.media_type.trim().is_empty())
+    {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "artifact media type is empty",
+        ));
+    }
+    let mut paths: Vec<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "duplicate artifact path",
         ));
     }
     Ok(())

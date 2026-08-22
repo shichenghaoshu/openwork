@@ -145,6 +145,36 @@ pub trait RunQueueRepository: Send + Sync {
         reason: Option<&str>,
         now: UtcTimestamp,
     ) -> Result<Run, OpenWorkError>;
+    /// Appends a worker runtime or sandbox event while proving the current
+    /// lease capability. The durable audit actor is always the lease owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported worker event, stale lease or
+    /// revision, expired lease, backwards time, or storage failure.
+    fn append_leased_runtime_audit(
+        &self,
+        lease: &RunLease,
+        expected_revision: u64,
+        event_type: AuditEventType,
+        now: UtcTimestamp,
+    ) -> Result<AuditEvent, OpenWorkError>;
+    /// Atomically persists a worker's scanned artifacts and their audit
+    /// events while proving the current lease capability. The durable audit
+    /// actor is always the lease owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale lease or revision, expired lease, invalid or
+    /// duplicate artifacts, backwards time, or storage failure. No artifact
+    /// or audit event is persisted when validation fails.
+    fn record_leased_artifacts(
+        &self,
+        lease: &RunLease,
+        expected_revision: u64,
+        artifacts: Vec<Artifact>,
+        now: UtcTimestamp,
+    ) -> Result<(), OpenWorkError>;
     /// Cancels unowned waiting work or records intent for a leased worker.
     ///
     /// # Errors
@@ -387,6 +417,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         if !state.runs.contains_key(run_id) {
             return Err(run_missing());
         }
+        reject_unbound_leased_write(&state, run_id)?;
         let events = state.audits.get(run_id).ok_or_else(audit_missing)?;
         if events
             .last()
@@ -414,6 +445,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         audit: AuditAppend,
     ) -> Result<bool, OpenWorkError> {
         let mut state = self.lock()?;
+        reject_unbound_leased_write(&state, &receipt.run_id)?;
         verify_execution_claim(&state, receipt)?;
         let events = state
             .audits
@@ -458,6 +490,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         audit: AuditAppend,
     ) -> Result<(), OpenWorkError> {
         let mut state = self.lock()?;
+        reject_unbound_leased_write(&state, run_id)?;
         if !state.runs.contains_key(run_id)
             || artifacts.iter().any(|artifact| &artifact.run_id != run_id)
         {
@@ -752,6 +785,79 @@ impl RunQueueRepository for InMemoryExecutionStore {
         Ok(updated)
     }
 
+    fn append_leased_runtime_audit(
+        &self,
+        lease: &RunLease,
+        expected_revision: u64,
+        event_type: AuditEventType,
+        now: UtcTimestamp,
+    ) -> Result<AuditEvent, OpenWorkError> {
+        ensure_worker_runtime_event(event_type)?;
+        let mut state = self.lock()?;
+        let _current = validate_memory_lease(&state, lease, expected_revision, now)?;
+        let events = state.audits.get(&lease.run.id).ok_or_else(audit_missing)?;
+        let event = AuditAppend::new(lease.owner.clone(), now).build(
+            lease.run.id.clone(),
+            u64::try_from(events.len())
+                .map_err(|_| internal_error("audit sequence overflow"))?
+                .checked_add(1)
+                .ok_or_else(|| internal_error("audit sequence overflow"))?,
+            event_type,
+            events.last().map(|event| event.event_hash().clone()),
+        )?;
+        state
+            .audits
+            .get_mut(&lease.run.id)
+            .ok_or_else(audit_missing)?
+            .push(event.clone());
+        Ok(event)
+    }
+
+    fn record_leased_artifacts(
+        &self,
+        lease: &RunLease,
+        expected_revision: u64,
+        artifacts: Vec<Artifact>,
+        now: UtcTimestamp,
+    ) -> Result<(), OpenWorkError> {
+        let mut state = self.lock()?;
+        let _current = validate_memory_lease(&state, lease, expected_revision, now)?;
+        validate_artifact_batch(&state, &lease.run.id, &artifacts)?;
+        let audit_chain = state.audits.get(&lease.run.id).ok_or_else(audit_missing)?;
+        let mut previous = audit_chain.last().map(|event| event.event_hash().clone());
+        let mut sequence = u64::try_from(audit_chain.len())
+            .map_err(|_| internal_error("audit sequence overflow"))?
+            .checked_add(1)
+            .ok_or_else(|| internal_error("audit sequence overflow"))?;
+        let mut events = Vec::with_capacity(artifacts.len());
+        for artifact in &artifacts {
+            let event = AuditAppend::new(lease.owner.clone(), now)
+                .with_artifact(artifact)
+                .build(
+                    lease.run.id.clone(),
+                    sequence,
+                    AuditEventType::ArtifactCreated,
+                    previous,
+                )?;
+            previous = Some(event.event_hash().clone());
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| internal_error("audit sequence overflow"))?;
+            events.push(event);
+        }
+        state
+            .artifacts
+            .entry(lease.run.id.clone())
+            .or_default()
+            .extend(artifacts);
+        state
+            .audits
+            .get_mut(&lease.run.id)
+            .ok_or_else(audit_missing)?
+            .extend(events);
+        Ok(())
+    }
+
     fn request_cancel(
         &self,
         run_id: &RunId,
@@ -966,6 +1072,70 @@ fn validate_memory_lease(
     }
     ensure_memory_audit_time(state, &lease.run.id, now, current.updated_at)?;
     Ok(current.clone())
+}
+
+fn reject_unbound_leased_write(state: &State, run_id: &RunId) -> Result<(), OpenWorkError> {
+    if state.leases.contains_key(run_id) {
+        return Err(state_error(
+            "leased runs must use a lease-capability-bound worker write",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_worker_runtime_event(event_type: AuditEventType) -> Result<(), OpenWorkError> {
+    if matches!(
+        event_type,
+        AuditEventType::SandboxCreated
+            | AuditEventType::RuntimeStarted
+            | AuditEventType::RuntimeOutput
+            | AuditEventType::RuntimeCompleted
+            | AuditEventType::SandboxDestroyed
+    ) {
+        return Ok(());
+    }
+    Err(state_error(
+        "leased worker audit event must describe runtime or sandbox activity",
+    ))
+}
+
+fn validate_artifact_batch(
+    state: &State,
+    run_id: &RunId,
+    artifacts: &[Artifact],
+) -> Result<(), OpenWorkError> {
+    if !state.runs.contains_key(run_id)
+        || artifacts.iter().any(|artifact| &artifact.run_id != run_id)
+    {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "artifact run mismatch",
+        ));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.media_type.trim().is_empty())
+    {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "artifact media type is empty",
+        ));
+    }
+    let existing = state.artifacts.get(run_id).cloned().unwrap_or_default();
+    if artifacts.iter().any(|candidate| {
+        existing.iter().any(|stored| stored.path == candidate.path)
+            || artifacts
+                .iter()
+                .filter(|item| item.path == candidate.path)
+                .count()
+                > 1
+    }) {
+        return Err(OpenWorkError::new(
+            ErrorCode::ArtifactInvalid,
+            "duplicate artifact path",
+        ));
+    }
+    Ok(())
 }
 
 fn append_memory_audit(

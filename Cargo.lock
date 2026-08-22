@@ -1535,6 +1535,7 @@ dependencies = [
  "openwork-policy",
  "openwork-runtime",
  "openwork-sandbox",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1558,11 +1559,15 @@ dependencies = [
  "axum",
  "openwork-core",
  "openwork-execution",
+ "openwork-runtime",
+ "openwork-sandbox",
+ "openwork-worker",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "tempfile",
  "time",
  "tokio",
  "tower",
@@ -1670,6 +1675,18 @@ dependencies = [
  "openwork-execution",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "openwork-worker"
+version = "0.1.0"
+dependencies = [
+ "openwork-core",
+ "openwork-execution",
+ "openwork-runtime",
+ "serde_json",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -2037,6 +2054,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

@@ -99,6 +99,23 @@ jobs:
       - run: cargo build --release --locked
       - run: test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
 
+  employee-workspace:
+    name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: employee-workspace' || 'employee-workspace' }}"
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/admin-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
   clippy:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: clippy' || 'clippy' }}"
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -129,24 +146,15 @@ jobs:
           trap 'docker compose -f compose/compose.yaml down --volumes' EXIT
           docker compose -f compose/compose.yaml up --detach --build --wait postgres openwork-control-api
           curl --fail --silent --show-error http://127.0.0.1:8080/health
-          run_json=$(curl --fail --silent --show-error \
+          run_status=$(curl --silent --show-error \
+            --output /tmp/openwork-run-response.json \
+            --write-out '%{http_code}' \
             --header 'Authorization: Bearer compose-smoke-token-0123456789abcdef' \
             --header 'Content-Type: application/json' \
             --data '{"runtime":"codex","workspace":"sales","prompt":"compose smoke prompt"}' \
             http://127.0.0.1:8080/v1/runs)
-          run_id=$(jq -er '.id' <<<"$run_json")
-          test "$(jq -r '.status' <<<"$run_json")" = queued
-          test "$(jq -r 'has("prompt")' <<<"$run_json")" = false
-          cancel_json=$(curl --fail --silent --show-error \
-            --request POST \
-            --header 'Authorization: Bearer compose-smoke-token-0123456789abcdef' \
-            "http://127.0.0.1:8080/v1/runs/$run_id/cancel")
-          test "$(jq -r '.status' <<<"$cancel_json")" = cancelled
-          test "$(jq -r '.confirmed' <<<"$cancel_json")" = true
-          curl --fail --silent --show-error \
-            --header 'Authorization: Bearer compose-smoke-token-0123456789abcdef' \
-            "http://127.0.0.1:8080/v1/runs/$run_id/events" \
-            | jq -e 'map(.event_type) == ["run_created", "cancel_confirmed"]'
+          test "$run_status" = 503
+          jq -e '.error == "runtime_worker_unavailable"' /tmp/openwork-run-response.json
           test "$(docker compose -f compose/compose.yaml exec -T postgres \
             psql -U openwork -d openwork -Atc 'SELECT MAX(version) FROM _sqlx_migrations')" = 4
 
