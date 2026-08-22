@@ -4,6 +4,8 @@ mod claude;
 mod codex;
 mod manifest;
 mod mock;
+mod opencode;
+mod pi;
 mod registry;
 mod system_downloader;
 
@@ -17,6 +19,8 @@ pub use manifest::{
     parse_manifest_json,
 };
 pub use mock::MockRuntime;
+pub use opencode::OpenCodeRuntime;
+pub use pi::PiRuntime;
 pub use registry::RuntimeRegistry;
 pub use system_downloader::{DownloadPolicy, SystemDownloader};
 

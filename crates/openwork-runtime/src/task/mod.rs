@@ -2,9 +2,15 @@
 
 mod claude;
 mod codex;
+mod opencode;
+mod pi;
 
 pub use claude::{CLAUDE_REQUIRED_FLAGS, CLAUDE_RUNTIME_ID, ClaudeTaskAdapter, ClaudeTaskDecoder};
 pub use codex::{CODEX_REQUIRED_FLAGS, CODEX_RUNTIME_ID, CodexTaskAdapter, CodexTaskDecoder};
+pub use opencode::{
+    OPENCODE_REQUIRED_FLAGS, OPENCODE_RUNTIME_ID, OpenCodeTaskAdapter, OpenCodeTaskDecoder,
+};
+pub use pi::{PI_REQUIRED_FLAGS, PI_RUNTIME_ID, PiTaskAdapter, PiTaskDecoder};
 
 use openwork_core::{ErrorCode, OpenWorkError, redact_json, redact_text};
 use openwork_execution::{
@@ -19,7 +25,11 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const PROVIDER_DOCS_ACCESSED_ON: &str = "2026-08-10";
+pub const PROVIDER_DOCS_ACCESSED_ON: &str = "2026-08-23";
+pub const OPENCODE_CLI_REFERENCE_URL: &str =
+    "https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/cli/cmd/run.ts";
+pub const PI_RPC_REFERENCE_URL: &str =
+    "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/rpc.md";
 pub const CLAUDE_CLI_REFERENCE_URL: &str = "https://code.claude.com/docs/en/cli-usage";
 pub const CLAUDE_HEADLESS_URL: &str = "https://code.claude.com/docs/en/headless";
 pub const CODEX_NON_INTERACTIVE_URL: &str = "https://learn.chatgpt.com/docs/non-interactive-mode";

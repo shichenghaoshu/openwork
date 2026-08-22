@@ -9,12 +9,12 @@ use openwork_execution::{
     SandboxWorkingDirectory, UtcTimestamp,
 };
 use openwork_runtime::task::{
-    CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, ClaudeTaskAdapter, CodexTaskAdapter,
+    CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, OPENCODE_RUNTIME_ID, PI_RUNTIME_ID,
 };
 use openwork_sandbox::{DockerSandbox, SystemDockerCli};
 use openwork_worker::{
-    OneTimePrompt, SingleRunWorker, StartDisposition, SupervisorConfig, WorkerEnvironment,
-    WorkerOutcome, WorkerTaskSpec,
+    OneTimePrompt, RuntimeExecutableConfig, SingleRunWorker, StartDisposition, SupervisorConfig,
+    WorkerEnvironment, WorkerOutcome, WorkerRuntimeRouter, WorkerTaskSpec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -84,6 +84,20 @@ impl WorkerRuntimeConfig {
         )?;
         register_provider(
             &mut providers,
+            OPENCODE_RUNTIME_ID,
+            "OPENWORK_OPENCODE_IMAGE",
+            "OPENWORK_OPENCODE_EXECUTABLE",
+            "/usr/local/bin/opencode",
+        )?;
+        register_provider(
+            &mut providers,
+            PI_RUNTIME_ID,
+            "OPENWORK_PI_IMAGE",
+            "OPENWORK_PI_EXECUTABLE",
+            "/usr/local/bin/pi",
+        )?;
+        register_provider(
+            &mut providers,
             CLAUDE_RUNTIME_ID,
             "OPENWORK_CLAUDE_IMAGE",
             "OPENWORK_CLAUDE_EXECUTABLE",
@@ -91,7 +105,7 @@ impl WorkerRuntimeConfig {
         )?;
         if providers.is_empty() {
             return Err(ConfigError(
-                "worker requires OPENWORK_CODEX_IMAGE or OPENWORK_CLAUDE_IMAGE",
+                "worker requires at least one configured runtime image",
             ));
         }
         Ok(Some(Self {
@@ -107,6 +121,27 @@ impl WorkerRuntimeConfig {
 
     pub(crate) fn runtimes(&self) -> BTreeSet<String> {
         self.providers.keys().cloned().collect()
+    }
+
+    fn router_config(&self) -> RuntimeExecutableConfig {
+        RuntimeExecutableConfig {
+            codex: self
+                .providers
+                .get(CODEX_RUNTIME_ID)
+                .map(|item| item.executable.clone()),
+            claude_code: self
+                .providers
+                .get(CLAUDE_RUNTIME_ID)
+                .map(|item| item.executable.clone()),
+            opencode: self
+                .providers
+                .get(OPENCODE_RUNTIME_ID)
+                .map(|item| item.executable.clone()),
+            pi: self
+                .providers
+                .get(PI_RUNTIME_ID)
+                .map(|item| item.executable.clone()),
+        }
     }
 }
 
@@ -313,51 +348,38 @@ fn execute_claim(
             return;
         }
     };
-    let result = prepare_environment(config, workspace_root, lease, output.clone()).and_then(
-        |(provider, environment)| {
-            let task = WorkerTaskSpec {
-                runtime: lease.run.runtime.clone(),
-                prompt_sha256: lease.run.prompt_sha256.clone(),
-                working_directory: SandboxWorkingDirectory::parse("/workspace")?,
-                timeout_seconds: environment.limits.timeout_seconds(),
-                capabilities: vec!["filesystem.read".to_owned(), "filesystem.write".to_owned()],
-            };
-            let supervisor = SupervisorConfig {
-                heartbeat_interval: HEARTBEAT_INTERVAL,
-                lease_ttl: LEASE_TTL,
-            };
-            let prompt = OneTimePrompt::new(prompt.into_string());
-            match lease.run.runtime.as_str() {
-                CODEX_RUNTIME_ID => SingleRunWorker::new(
-                    store,
-                    sandbox,
-                    &CodexTaskAdapter::new(provider.executable.clone()),
-                )
-                .with_supervisor(supervisor)?
-                .execute(
-                    lease.clone(),
-                    task,
-                    prompt,
-                    environment,
-                    StartDisposition::Run,
-                ),
-                CLAUDE_RUNTIME_ID => SingleRunWorker::new(
-                    store,
-                    sandbox,
-                    &ClaudeTaskAdapter::new(provider.executable.clone()),
-                )
-                .with_supervisor(supervisor)?
-                .execute(
-                    lease.clone(),
-                    task,
-                    prompt,
-                    environment,
-                    StartDisposition::Run,
-                ),
-                _ => Err(worker_error("claimed runtime is not configured")),
-            }
-        },
-    );
+    let result = (|| {
+        let router = WorkerRuntimeRouter::new(config.router_config());
+        let requested = WorkerTaskSpec {
+            runtime: lease.run.runtime.clone(),
+            prompt_sha256: lease.run.prompt_sha256.clone(),
+            working_directory: SandboxWorkingDirectory::parse("/workspace")?,
+            timeout_seconds: 600,
+            capabilities: vec!["filesystem.read".to_owned(), "filesystem.write".to_owned()],
+        };
+        let (selection, task) = router.resolve_task_spec(lease, requested)?;
+        let (_provider, environment) = prepare_environment(
+            config,
+            workspace_root,
+            lease,
+            output.clone(),
+            &selection.selected_runtime,
+        )?;
+        let supervisor = SupervisorConfig {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            lease_ttl: LEASE_TTL,
+        };
+        let prompt = OneTimePrompt::new(prompt.into_string());
+        SingleRunWorker::new(store, sandbox, router.adapter(&selection)?)
+            .with_supervisor(supervisor)?
+            .execute(
+                lease.clone(),
+                task,
+                prompt,
+                environment,
+                StartDisposition::Run,
+            )
+    })();
     match result {
         Ok(WorkerOutcome::Completed(run)) if run.status == RunStatus::Succeeded => {}
         Ok(_) => remove_failed_output(&config.output_root, &output),
@@ -374,10 +396,11 @@ fn prepare_environment(
     workspace_root: &Path,
     lease: &RunLease,
     output: PathBuf,
+    selected_runtime: &str,
 ) -> Result<(ProviderConfig, WorkerEnvironment), OpenWorkError> {
     let provider = config
         .providers
-        .get(&lease.run.runtime)
+        .get(selected_runtime)
         .cloned()
         .ok_or_else(|| worker_error("claimed runtime is not configured"))?;
     let input = ApprovedMountDirectory::under_root(&lease.run.workspace, workspace_root)?;
