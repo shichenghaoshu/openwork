@@ -10,7 +10,7 @@ rust-version.workspace = true
 openwork-core = { path = "../openwork-core" }
 openwork-execution = { path = "../openwork-execution" }
 serde.workspace = true
-yaml_serde = "=0.10.4"
+yaml_serde = "=0.10.7"
 
 [dev-dependencies]
 jsonschema.workspace = true
