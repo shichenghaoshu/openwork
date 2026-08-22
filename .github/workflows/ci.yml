@@ -156,7 +156,7 @@ jobs:
           test "$run_status" = 503
           jq -e '.error == "runtime_worker_unavailable"' /tmp/openwork-run-response.json
           test "$(docker compose -f compose/compose.yaml exec -T postgres \
-            psql -U openwork -d openwork -Atc 'SELECT MAX(version) FROM _sqlx_migrations')" = 4
+            psql -U openwork -d openwork -Atc 'SELECT MAX(version) FROM _sqlx_migrations')" = 5
 
   pack-validation:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: pack-validation' || 'pack-validation' }}"
@@ -164,7 +164,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: test ! -e contracts/schemas/capability-pack.v1.schema.json
+      - run: test -s contracts/schemas/capability-pack.v1.schema.json
+      - name: Validate the schema and checked-in App registry
+        run: cargo test -p openwork-apps --test manifest --locked
 
   license-check:
     name: "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-skip: license-check' || 'license-check' }}"
