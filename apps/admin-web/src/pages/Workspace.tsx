@@ -1,9 +1,10 @@
-export default function Workspace(): React.JSX.Element {
+export default function Workspace({ onNewTask }: { onNewTask: () => void }): React.JSX.Element {
   return <div className="page intro">
     <p className="eyebrow">Employee Workspace</p>
-    <h1>Work that stays accountable.</h1>
-    <p>Start a controlled task, follow its state, and review the approvals and connectors that shape its work.</p>
+    <h1>Start work. Keep context close.</h1>
+    <p>Create a task, add the files it needs, and stay informed when a decision needs you.</p>
+    <button onClick={onNewTask}>New task</button>
     <div className="rule" />
-    <p className="muted">The desktop app talks only to the configured OpenWork Control API. API credentials stay in the Electron main process.</p>
+    <p className="muted">Your tasks, files, apps, and decisions live here.</p>
   </div>
 }

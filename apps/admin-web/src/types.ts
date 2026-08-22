@@ -9,6 +9,10 @@ export interface Run {
   created_at: string
   updated_at: string
   terminal_reason?: string | null
+  apps_used?: string[]
+  artifacts?: Array<{ id?: string; name?: string; [key: string]: unknown }>
+  actions?: Array<{ id?: string; status?: string; description?: string; [key: string]: unknown }>
+  approvals?: Array<{ id?: string; status?: string; [key: string]: unknown }>
 }
 
 export interface Approval {
@@ -34,6 +38,32 @@ export interface Connector {
 export interface ConnectorTool {
   id: string
   name?: string
+  description?: string
+  [key: string]: unknown
+}
+
+export interface WorkspaceFile {
+  id: string
+  name: string
+  content_type?: string
+  size_bytes?: number
+  created_at?: string
+  [key: string]: unknown
+}
+
+export interface WorkspaceApp {
+  id: string
+  name?: string
+  description?: string
+  enabled?: boolean
+  installed?: boolean
+  [key: string]: unknown
+}
+
+export interface RuntimeInfo {
+  id: string
+  name?: string
+  status?: string
   description?: string
   [key: string]: unknown
 }

@@ -61,6 +61,37 @@ async function controlRequest(
   }
 }
 
+async function uploadFile(
+  name: string,
+  mimeType: string,
+  bytes: ArrayBuffer,
+): Promise<BridgeResponse> {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name) || bytes.byteLength === 0 || bytes.byteLength > 8 * 1024 * 1024) {
+    return { ok: false, status: 400, error: 'Choose a non-empty file smaller than 8 MB with a portable filename.' }
+  }
+  try {
+    const { baseUrl, token } = controlApiConfig()
+    const response = await fetch(new URL('/v1/files', baseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': mimeType || 'application/octet-stream',
+        'x-openwork-filename': name,
+      },
+      body: bytes,
+    })
+    const text = await response.text()
+    let data: unknown
+    try { data = text ? JSON.parse(text) : undefined } catch { data = undefined }
+    if (response.ok) return { ok: true, status: response.status, data }
+    const message = typeof data === 'object' && data !== null && 'message' in data
+      ? String(data.message) : text || `Control API request failed (${response.status})`
+    return { ok: false, status: response.status, error: message }
+  } catch (error) {
+    return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1280,
@@ -83,11 +114,17 @@ function createWindow(): void {
 
 function registerIpc(): void {
   ipcMain.handle('control:health', () => controlRequest('GET', '/health'))
-  ipcMain.handle('control:createRun', (_event, body: { runtime: string; workspace: string; prompt: string }) =>
+  ipcMain.handle('control:createRun', (_event, body: { runtime: string; workspace: string; prompt: string; file_ids?: string[] }) =>
     controlRequest('POST', '/v1/runs', body),
   )
   ipcMain.handle('control:getRun', (_event, id: string) =>
     validId(id) ? controlRequest('GET', `/v1/runs/${id}`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),
+  )
+  ipcMain.handle('control:listRunArtifacts', (_event, id: string) =>
+    validId(id) ? controlRequest('GET', `/v1/runs/${id}/artifacts`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),
+  )
+  ipcMain.handle('control:listRunEvents', (_event, id: string) =>
+    validId(id) ? controlRequest('GET', `/v1/runs/${id}/events`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),
   )
   ipcMain.handle('control:cancelRun', (_event, id: string) =>
     validId(id) ? controlRequest('POST', `/v1/runs/${id}/cancel`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),
@@ -105,6 +142,27 @@ function registerIpc(): void {
     encodeURIComponent(id) === id && id.length > 0
       ? controlRequest('GET', `/v1/connectors/${encodeURIComponent(id)}/tools`)
       : Promise.resolve({ ok: false, status: 400, error: 'Invalid connector ID.' }),
+  )
+  ipcMain.handle('control:listFiles', () => controlRequest('GET', '/v1/files'))
+  ipcMain.handle('control:uploadFile', (_event, name: string, mimeType: string, bytes: ArrayBuffer) =>
+    uploadFile(name, mimeType, bytes),
+  )
+  ipcMain.handle('control:listApps', () => controlRequest('GET', '/v1/apps'))
+  ipcMain.handle('control:listStoreApps', () => controlRequest('GET', '/v1/apps'))
+  ipcMain.handle('control:installApp', (_event, id: string) =>
+    encodeURIComponent(id) === id && id.length > 0
+      ? controlRequest('POST', `/v1/apps/${encodeURIComponent(id)}/install`)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid app ID.' }),
+  )
+  ipcMain.handle('control:setAppEnabled', (_event, id: string, enabled: boolean) =>
+    encodeURIComponent(id) === id && id.length > 0
+      ? controlRequest('POST', `/v1/apps/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid app ID.' }),
+  )
+  ipcMain.handle('control:listRuntimes', () => controlRequest('GET', '/v1/admin/runtimes'))
+  ipcMain.handle('control:getSettings', () => controlRequest('GET', '/v1/admin/settings'))
+  ipcMain.handle('control:updateSettings', (_event, body: { default_runtime: string }) =>
+    controlRequest('POST', '/v1/admin/settings', body),
   )
 }
 
