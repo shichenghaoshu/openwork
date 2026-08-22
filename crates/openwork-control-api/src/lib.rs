@@ -44,7 +44,9 @@ use connector_runtime::{ConnectorRegistry, LookupError};
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const PROMPT_DELIVERY_CAPACITY: usize = 128;
 const PROMPT_DELIVERY_MAX_BYTES: usize = 256 * 1024;
-const PROMPT_DELIVERY_TTL: Duration = Duration::from_mins(10);
+// Capacity is 128 and one worker run is bounded at ten minutes. A 24-hour
+// process-local window covers the worst serial backlog plus recovery overhead.
+const PROMPT_DELIVERY_TTL: Duration = Duration::from_hours(24);
 
 #[derive(Clone)]
 pub struct Config {

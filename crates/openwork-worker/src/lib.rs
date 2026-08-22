@@ -6,8 +6,8 @@ use openwork_execution::artifact::ArtifactScanner;
 use openwork_execution::store::{CancellationEvidence, RunLease, RunQueueRepository};
 use openwork_execution::{
     ApprovedMountDirectory, Artifact, DigestPinnedImageRef, Run, RunStatus, RuntimeTask,
-    SandboxBackend, SandboxLimits, SandboxResult, SandboxTermination, SandboxUser,
-    SandboxWorkingDirectory, Sha256Digest, UtcTimestamp,
+    SandboxBackend, SandboxLimits, SandboxNetworkPolicy, SandboxResult, SandboxTermination,
+    SandboxUser, SandboxWorkingDirectory, Sha256Digest, UtcTimestamp,
 };
 use openwork_runtime::task::{RuntimeTaskAdapter, decode_sandbox_result, into_sandbox_request};
 use std::fmt;
@@ -55,6 +55,7 @@ pub struct WorkerEnvironment {
     pub input_directory: ApprovedMountDirectory,
     pub output_directory: ApprovedMountDirectory,
     pub limits: SandboxLimits,
+    pub network: SandboxNetworkPolicy,
     pub artifact_output_root: PathBuf,
     pub max_artifact_bytes: u64,
 }
@@ -329,7 +330,7 @@ impl<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter>
             environment.output_directory.clone(),
             environment.limits,
         ) {
-            Ok(request) => request,
+            Ok(request) => request.with_network(environment.network.clone()),
             Err(error) => return self.fail_after_error(running, error, now),
         };
         let (running, result) = match self.execute_with_cancellation(running.clone(), &request) {
@@ -936,6 +937,7 @@ mod tests {
             artifact_output_root: output_directory.as_path().to_path_buf(),
             output_directory,
             limits: SandboxLimits::new(1000, 64 * 1024 * 1024, 64, 30, 1024).expect("limits"),
+            network: SandboxNetworkPolicy::Disabled,
             max_artifact_bytes: 1024,
         }
     }

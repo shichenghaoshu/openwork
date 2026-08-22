@@ -936,10 +936,48 @@ impl ApprovedMountDirectory {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SandboxNetworkName(String);
+
+impl SandboxNetworkName {
+    /// Validates a dedicated container network name selected by an operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, oversized, or non-portable name.
+    pub fn parse(value: impl Into<String>) -> Result<Self, OpenWorkError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 63
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            || !value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !value
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return Err(invalid_contract("sandbox network name is invalid"));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxNetworkPolicy {
     Disabled,
+    Restricted(SandboxNetworkName),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -983,6 +1021,13 @@ impl SandboxRequest {
             output_directory,
             limits,
         })
+    }
+
+    /// Selects a previously provisioned, operator-controlled network.
+    #[must_use]
+    pub fn with_network(mut self, network: SandboxNetworkPolicy) -> Self {
+        self.network = network;
+        self
     }
 }
 

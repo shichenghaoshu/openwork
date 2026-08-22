@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { Run } from '../types'
 
-const terminal = new Set(['Succeeded', 'Failed', 'Cancelled', 'TimedOut'])
+const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out'])
 
 export default function Tasks(): React.JSX.Element {
   const [runtime, setRuntime] = useState('codex')

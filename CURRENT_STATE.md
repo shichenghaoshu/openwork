@@ -38,6 +38,9 @@ scoped by evidence level and were last refreshed on 2026-08-22.
   lease, observes cancellation intent, records bounded runtime/artifact audit,
   and completes through lease-bound repository methods. Missing prompts after
   restart fail closed instead of being persisted in plaintext.
+- An enabled provider worker requires an explicitly named, operator-provisioned
+  container network; it never falls back to Docker default or host networking.
+  Deployments must enforce provider-only egress on that dedicated network.
 - Policy tests cover automatic filesystem read/write, exact-bound L3
   `email.send` approval, single-use claim consumption, replay and parameter
   tampering rejection, and direct L4 `database.delete` denial.

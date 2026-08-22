@@ -359,9 +359,9 @@ fn absolute_executable(name: &'static str, default: &str) -> Result<PathBuf, Con
 fn discover_tools(config: &ProcessConfig) -> Result<Vec<ConnectorTool>, McpError> {
     let mut child = spawn(config)?;
     let result = exchange(&mut child, config.timeout);
-    if result.is_err() {
-        let _ = child.kill();
-    }
+    // Discovery sessions are one-shot. Terminate even after success so a
+    // normal long-lived stdio server cannot block this request in `wait`.
+    let _ = child.kill();
     let _ = child.wait();
     result
 }

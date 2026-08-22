@@ -1,4 +1,4 @@
-export type RunStatus = 'Queued' | 'Planning' | 'AwaitingApproval' | 'Running' | 'Succeeded' | 'Failed' | 'Cancelled' | 'TimedOut'
+export type RunStatus = 'queued' | 'planning' | 'awaiting_approval' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 
 export interface Run {
   id: string

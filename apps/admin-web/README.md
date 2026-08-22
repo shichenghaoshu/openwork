@@ -29,6 +29,11 @@ probes for 15 seconds, so refreshing the interface does not repeatedly call an
 upstream service. Connector execution and credentials stay in the Control API
 process; the renderer receives only redacted tool metadata.
 
+An enabled runtime worker also requires `OPENWORK_PROVIDER_NETWORK`. This must
+name a separately provisioned container network whose egress policy permits
+only the configured AI provider endpoints; OpenWork does not fall back to the
+Docker default bridge or host networking.
+
 ## Development
 
 ```bash

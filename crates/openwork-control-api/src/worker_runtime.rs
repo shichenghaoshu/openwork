@@ -5,7 +5,8 @@ use openwork_core::{ErrorCode, OpenWorkError};
 use openwork_execution::store::{RunLease, RunQueueRepository, postgres::PostgresExecutionStore};
 use openwork_execution::{
     ActorId, ApprovedMountDirectory, DEFAULT_MAX_ARTIFACT_BYTES, DigestPinnedImageRef, RunStatus,
-    SandboxBackend, SandboxLimits, SandboxUser, SandboxWorkingDirectory, UtcTimestamp,
+    SandboxBackend, SandboxLimits, SandboxNetworkName, SandboxNetworkPolicy, SandboxUser,
+    SandboxWorkingDirectory, UtcTimestamp,
 };
 use openwork_runtime::task::{
     CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, ClaudeTaskAdapter, CodexTaskAdapter,
@@ -43,6 +44,7 @@ pub(crate) struct WorkerRuntimeConfig {
     temporary_root: PathBuf,
     output_root: PathBuf,
     actor: ActorId,
+    provider_network: SandboxNetworkName,
     providers: BTreeMap<String, ProviderConfig>,
 }
 
@@ -67,6 +69,11 @@ impl WorkerRuntimeConfig {
             std::env::var("OPENWORK_WORKER_ACTOR").unwrap_or_else(|_| "worker:local".to_owned()),
         )
         .map_err(|_| ConfigError("OPENWORK_WORKER_ACTOR is invalid"))?;
+        let provider_network = SandboxNetworkName::parse(
+            std::env::var("OPENWORK_PROVIDER_NETWORK")
+                .map_err(|_| ConfigError("OPENWORK_PROVIDER_NETWORK is required"))?,
+        )
+        .map_err(|_| ConfigError("OPENWORK_PROVIDER_NETWORK is invalid"))?;
         let mut providers = BTreeMap::new();
         register_provider(
             &mut providers,
@@ -93,6 +100,7 @@ impl WorkerRuntimeConfig {
             temporary_root,
             output_root,
             actor,
+            provider_network,
             providers,
         }))
     }
@@ -382,6 +390,7 @@ fn prepare_environment(
             input_directory: input,
             output_directory: output_mount,
             limits: SandboxLimits::new(1_000, 512 * 1024 * 1024, 128, 600, 4 * 1024 * 1024)?,
+            network: SandboxNetworkPolicy::Restricted(config.provider_network.clone()),
             artifact_output_root: output,
             max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
         },
