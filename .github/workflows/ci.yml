@@ -21,7 +21,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup component add rustfmt
       - run: cargo fmt --all --check
 
@@ -30,7 +30,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo check --workspace --all-targets --locked
 
   unit:
@@ -38,7 +38,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo test --workspace --lib --locked
 
   integration:
@@ -46,7 +46,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo test --workspace --tests --locked
 
   real-docker-e2e:
@@ -58,7 +58,7 @@ jobs:
       OPENWORK_DOCKER_BIN: /usr/bin/docker
       OPENWORK_SALES_SANDBOX_IMAGE: docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Pull the digest-pinned analyzer image
         run: docker pull "$OPENWORK_SALES_SANDBOX_IMAGE"
       - name: Run the real Docker sandbox lifecycle
@@ -86,7 +86,7 @@ jobs:
       OPENWORK_TEST_DATABASE_URL: postgresql://openwork:openwork-test-password@127.0.0.1:5432/openwork_test
       OPENWORK_TEST_DATABASE_RESET: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run real Postgres CAS and recovery races
         run: cargo test -p openwork-execution --features postgres --test postgres_concurrency --locked -- --nocapture
 
@@ -95,7 +95,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo build --release --locked
       - run: test "$(target/release/openwork --version)" = "OpenWork 0.1.0"
 
@@ -107,7 +107,7 @@ jobs:
       run:
         working-directory: apps/admin-web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -121,7 +121,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup component add clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -130,7 +130,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate the production Compose model
         env:
           OPENWORK_DB_PASSWORD: compose-smoke-password
@@ -163,7 +163,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: test ! -e contracts/schemas/capability-pack.v1.schema.json
 
   license-check:
@@ -171,7 +171,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: test -s LICENSE && test -s NOTICE && test -s THIRD_PARTY_NOTICES.md
       - run: cargo metadata --format-version 1 --locked > /tmp/openwork-cargo-metadata.json
       - run: '! jq -e ''.packages[] | select(.license == null)'' /tmp/openwork-cargo-metadata.json'
@@ -181,7 +181,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo metadata --format-version 1 --locked > /tmp/openwork-cargo-sbom-input.json
       - run: test -s /tmp/openwork-cargo-sbom-input.json
 
@@ -190,7 +190,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Reject common committed secret formats
         run: '! git grep -nE "(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY)"'
 
@@ -203,7 +203,7 @@ jobs:
       security-events: write
       packages: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Initialize CodeQL for Rust
         uses: github/codeql-action/init@v4.36.0
         with:
@@ -217,7 +217,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the deployed Control API image
         run: docker build --file compose/Dockerfile.control-api --tag openwork-control-api:ci .
       - name: Scan the deployed image
@@ -234,5 +234,5 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: node scripts/check-doc-links.mjs
