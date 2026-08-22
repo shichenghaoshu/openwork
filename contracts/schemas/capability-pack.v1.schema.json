@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openwork.io/schemas/capability-pack.v1.schema.json",
+  "title": "OpenWork Capability Pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "provider", "capabilities", "permissions"],
+  "properties": {
+    "apiVersion": { "const": "openwork.io/v1" },
+    "kind": { "const": "CapabilityPack" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "version", "description"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 4096 }
+      }
+    },
+    "provider": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "connector"],
+          "properties": { "type": { "const": "mcp" }, "connector": { "$ref": "#/$defs/id" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "adapter"],
+          "properties": { "type": { "const": "cli" }, "adapter": { "$ref": "#/$defs/id" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "adapter"],
+          "properties": { "type": { "const": "native" }, "adapter": { "$ref": "#/$defs/id" } }
+        }
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "risk"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+          "risk": { "enum": ["L0", "L1", "L2", "L3", "L4"] },
+          "input_schema": { "type": "object" }
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network"],
+      "properties": {
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": { "$ref": "#/$defs/stringList" },
+            "write": { "$ref": "#/$defs/stringList" }
+          }
+        },
+        "network": { "enum": ["none", "restricted"] },
+        "credentials": { "$ref": "#/$defs/stringList" }
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+    "stringList": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1, "maxLength": 256 }, "uniqueItems": true }
+  }
+}

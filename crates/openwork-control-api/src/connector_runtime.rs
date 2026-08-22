@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::ConfigError;
+use openwork_execution::action_executor::ClaimedAction;
 
 const GITHUB_IMAGE: &str = "ghcr.io/github/github-mcp-server@sha256:1817b57d43916532dc002bdc5f344d639bd9fb54a9148d42168458f7c3280567";
 const LARK_PACKAGE: &str = "@larksuiteoapi/lark-mcp@0.5.1";
@@ -23,6 +24,7 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOOLS: usize = 512;
 const MAX_TOOL_NAME_BYTES: usize = 256;
 const MAX_TOOL_TEXT_BYTES: usize = 4 * 1024;
+const MAX_CALL_RESULT_BYTES: usize = 256 * 1024;
 
 /// Environment-derived MCP connector definitions.
 #[derive(Clone)]
@@ -171,6 +173,93 @@ impl ConnectorRegistry {
             );
         result.map_err(|_| LookupError::Unavailable)
     }
+
+    /// Invokes only a capability-to-tool mapping compiled into `OpenWork`.
+    /// Callers cannot name a connector tool directly.
+    pub(super) fn call_capability(
+        &self,
+        capability: &str,
+        parameters: &Value,
+    ) -> Result<Value, CallError> {
+        let mapping = github_mapping(capability).ok_or(CallError::CapabilityNotMapped)?;
+        let arguments = github_arguments(mapping, parameters)?;
+        let entry = self.entries.get("github").ok_or(CallError::Unavailable)?;
+        let process = entry.process.as_ref().ok_or(CallError::NotConfigured)?;
+        call_tool(process, mapping.tool, &arguments, mapping.read_only).map_err(CallError::from)
+    }
+}
+
+/// Internal side-effect boundary. It accepts the execution crate's verified,
+/// consumed claim type rather than HTTP data, so clients cannot submit an
+/// `approved: true` flag or replay a bare capability request.
+#[allow(dead_code, clippy::needless_pass_by_value)]
+pub(super) fn execute_claimed_github_capability(
+    registry: &ConnectorRegistry,
+    claimed: ClaimedAction,
+) -> Result<Value, CallError> {
+    let action = claimed.action();
+    if action.action != "github.issue.create" {
+        return Err(CallError::CapabilityNotMapped);
+    }
+    registry.call_capability(&action.action, &action.parameters)
+}
+
+#[derive(Clone, Copy)]
+struct GithubCapabilityMapping {
+    tool: &'static str,
+    read_only: bool,
+    fixed_method: Option<&'static str>,
+}
+
+fn github_mapping(capability: &str) -> Option<GithubCapabilityMapping> {
+    let (tool, read_only, fixed_method) = match capability {
+        "github.repository.read" => ("search_repositories", true, None),
+        "github.file.read" => ("get_file_contents", true, None),
+        "github.issue.read" => ("list_issues", true, None),
+        "github.actions.read" => ("actions_list", true, Some("list_workflow_runs")),
+        "github.pull_request.read" => ("list_pull_requests", true, None),
+        "github.issue.create" => ("issue_write", false, Some("create")),
+        _ => return None,
+    };
+    Some(GithubCapabilityMapping {
+        tool,
+        read_only,
+        fixed_method,
+    })
+}
+
+fn github_arguments(
+    mapping: GithubCapabilityMapping,
+    parameters: &Value,
+) -> Result<Value, CallError> {
+    let mut arguments = parameters
+        .as_object()
+        .cloned()
+        .ok_or(CallError::InvalidParameters)?;
+    if let Some(method) = mapping.fixed_method {
+        if arguments
+            .get("method")
+            .is_some_and(|value| value.as_str() != Some(method))
+        {
+            return Err(CallError::InvalidParameters);
+        }
+        arguments.insert("method".to_owned(), Value::String(method.to_owned()));
+    }
+    Ok(Value::Object(arguments))
+}
+
+#[derive(Debug)]
+pub(super) enum CallError {
+    CapabilityNotMapped,
+    InvalidParameters,
+    NotConfigured,
+    Unavailable,
+}
+
+impl From<McpError> for CallError {
+    fn from(_: McpError) -> Self {
+        Self::Unavailable
+    }
 }
 
 #[derive(Clone)]
@@ -259,7 +348,6 @@ fn github_from_env() -> Result<ConnectorDefinition, ConfigError> {
                     "GITHUB_TOOLSETS".to_owned(),
                     SecretValue("repos,issues,pull_requests,actions,users".to_owned()),
                 ),
-                ("GITHUB_READ_ONLY".to_owned(), SecretValue("1".to_owned())),
             ]);
             if let Some(host) = optional_nonempty_env("OPENWORK_DOCKER_HOST") {
                 environment.insert("DOCKER_HOST".to_owned(), SecretValue(host));
@@ -440,6 +528,98 @@ fn exchange(child: &mut Child, timeout: Duration) -> Result<Vec<ConnectorTool>, 
     parse_tools(&response)
 }
 
+fn call_tool(
+    config: &ProcessConfig,
+    expected_tool: &str,
+    parameters: &Value,
+    require_read_only: bool,
+) -> Result<Value, McpError> {
+    let mut child = spawn(config)?;
+    let result = call_exchange(
+        &mut child,
+        config.timeout,
+        expected_tool,
+        parameters,
+        require_read_only,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn call_exchange(
+    child: &mut Child,
+    timeout: Duration,
+    expected_tool: &str,
+    parameters: &Value,
+    require_read_only: bool,
+) -> Result<Value, McpError> {
+    let stdout = child.stdout.take().ok_or(McpError::Io)?;
+    let stderr = child.stderr.take().ok_or(McpError::Io)?;
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
+    });
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if sender.send(Ok(line)).is_err() => break,
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = sender.send(Err(McpError::Io));
+                    break;
+                }
+            }
+        }
+    });
+    let stdin = child.stdin.as_mut().ok_or(McpError::Io)?;
+    send_json(
+        stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"openwork-control","version":env!("CARGO_PKG_VERSION")}}}),
+    )?;
+    let deadline = Instant::now() + timeout;
+    if receive_response(&receiver, 1, deadline)?
+        .get("result")
+        .is_none()
+    {
+        return Err(McpError::Protocol);
+    }
+    send_json(
+        stdin,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )?;
+    send_json(
+        stdin,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    )?;
+    let tools = parse_tools(&receive_response(&receiver, 2, deadline)?)?;
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == expected_tool)
+        .ok_or(McpError::Protocol)?;
+    if require_read_only && !tool.read_only {
+        return Err(McpError::Protocol);
+    }
+    if serde_json::to_vec(parameters).map_or(true, |encoded| encoded.len() > 64 * 1024) {
+        return Err(McpError::OutputLimit);
+    }
+    send_json(
+        stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":expected_tool,"arguments":parameters}}),
+    )?;
+    let output = receive_response(&receiver, 3, deadline)?;
+    if serde_json::to_vec(&output).map_or(true, |encoded| encoded.len() > MAX_CALL_RESULT_BYTES) {
+        return Err(McpError::OutputLimit);
+    }
+    if output.get("error").is_some() {
+        return Err(McpError::Protocol);
+    }
+    output.get("result").cloned().ok_or(McpError::Protocol)
+}
+
 fn send_json(stdin: &mut impl Write, value: &Value) -> Result<(), McpError> {
     serde_json::to_writer(&mut *stdin, value).map_err(|_| McpError::Io)?;
     stdin.write_all(b"\n").map_err(|_| McpError::Io)?;
@@ -537,8 +717,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn github_capability_mapping_is_exact_and_rejects_arbitrary_tools() {
+        let file = github_mapping("github.file.read").expect("mapped read capability");
+        assert_eq!(file.tool, "get_file_contents");
+        assert!(file.read_only);
+        let create = github_mapping("github.issue.create").expect("mapped write capability");
+        assert_eq!(create.tool, "issue_write");
+        assert_eq!(create.fixed_method, Some("create"));
+        assert!(!create.read_only);
+        assert!(github_arguments(create, &json!({"method":"update"})).is_err());
+        assert_eq!(
+            github_arguments(create, &json!({"owner":"o"}))
+                .expect("fixed method")
+                .get("method")
+                .and_then(Value::as_str),
+            Some("create")
+        );
+        assert!(github_mapping("github.tools.call").is_none());
+        assert!(github_mapping("delete_repository").is_none());
+    }
+
+    #[test]
     #[ignore = "requires Docker, a running daemon, and OPENWORK_GITHUB_TOKEN"]
-    fn real_github_mcp_lists_read_only_tools() {
+    fn real_github_mcp_exposes_exact_governed_tools() {
         let definition = github_from_env().expect("valid GitHub MCP configuration");
         assert!(
             definition.process.is_some(),
@@ -549,6 +750,53 @@ mod tests {
         });
         let tools = registry.tools("github").expect("GitHub MCP tools/list");
         assert!(!tools.is_empty());
-        assert!(tools.iter().all(|tool| tool.read_only));
+        for capability in [
+            "github.repository.read",
+            "github.file.read",
+            "github.issue.read",
+            "github.actions.read",
+            "github.pull_request.read",
+        ] {
+            let mapping = github_mapping(capability).expect("compiled mapping");
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool.name == mapping.tool && tool.read_only),
+                "missing read-only tool {}",
+                mapping.tool
+            );
+        }
+        let create = github_mapping("github.issue.create").expect("create mapping");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == create.tool && !tool.read_only)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Docker, a running daemon, and OPENWORK_GITHUB_TOKEN"]
+    fn real_github_mcp_reads_repository_through_capability_mapping() {
+        let definition = github_from_env().expect("valid GitHub MCP configuration");
+        assert!(
+            definition.process.is_some(),
+            "OPENWORK_GITHUB_TOKEN is required"
+        );
+        let registry = ConnectorRegistry::new(ConnectorRuntimeConfig {
+            definitions: vec![definition],
+        });
+        let result = registry
+            .call_capability(
+                "github.repository.read",
+                &json!({
+                    "query": "openwork in:name user:shichenghaoshu",
+                    "minimal_output": true,
+                    "perPage": 1
+                }),
+            )
+            .expect("governed GitHub repository read");
+        let encoded = serde_json::to_vec(&result).expect("bounded MCP result");
+        assert!(!encoded.is_empty());
+        assert!(encoded.len() <= MAX_CALL_RESULT_BYTES);
     }
 }

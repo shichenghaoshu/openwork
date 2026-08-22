@@ -1,0 +1,32 @@
+apiVersion: openwork.io/v1
+kind: CapabilityPack
+metadata:
+  id: org.openwork.feishu
+  name: Feishu
+  version: 1.0.0
+  description: Read approved chats, documents, wikis, and tables.
+provider:
+  type: mcp
+  connector: lark
+capabilities:
+  - id: feishu.chat.search
+    description: Search chats visible to the configured application.
+    risk: L0
+  - id: feishu.message.read
+    description: Read messages visible to the configured application.
+    risk: L0
+  - id: feishu.document.read
+    description: Read document content.
+    risk: L0
+  - id: feishu.wiki.read
+    description: Search and read wiki nodes.
+    risk: L0
+  - id: feishu.bitable.read
+    description: Search table records.
+    risk: L0
+permissions:
+  filesystem:
+    read: []
+    write: []
+  network: restricted
+  credentials: [feishu.app]

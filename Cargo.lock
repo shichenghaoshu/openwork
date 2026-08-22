@@ -1521,10 +1521,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openwork-apps"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "openwork-core",
+ "openwork-execution",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "yaml_serde",
+]
+
+[[package]]
 name = "openwork-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "openwork-apps",
  "openwork-config",
  "openwork-core",
  "openwork-doctor",
@@ -1539,6 +1554,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -1557,6 +1573,8 @@ name = "openwork-control-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "jsonschema",
+ "openwork-apps",
  "openwork-core",
  "openwork-execution",
  "openwork-runtime",
@@ -1595,6 +1613,7 @@ dependencies = [
 name = "openwork-e2e"
 version = "0.1.0"
 dependencies = [
+ "openwork-apps",
  "openwork-core",
  "openwork-execution",
  "openwork-policy",

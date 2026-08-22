@@ -113,7 +113,13 @@ fn runtime_commands_expose_registered_and_error_states() {
         .unwrap();
     assert!(list.status.success());
     let runtimes: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
-    assert_eq!(runtimes[0]["metadata"]["id"], "claude-code");
+    let ids = runtimes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|runtime| runtime["metadata"]["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["auto", "claude-code", "codex", "opencode", "pi"]);
 
     let claude = openwork()
         .args(["runtime", "info", "claude-code", "--json"])
