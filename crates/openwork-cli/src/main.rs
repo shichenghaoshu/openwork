@@ -634,7 +634,7 @@ fn execute_run(
         .json::<Run>()
         .map_err(|_| (control_error("Control API returned an invalid run"), json))?;
     if wait {
-        let deadline = Instant::now() + Duration::from_secs(3600);
+        let deadline = Instant::now() + Duration::from_hours(1);
         while !run.status.is_terminal() {
             if Instant::now() >= deadline {
                 return Err((control_error("Timed out waiting for the run"), json));
