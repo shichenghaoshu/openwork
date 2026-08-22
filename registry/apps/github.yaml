@@ -1,0 +1,90 @@
+apiVersion: openwork.io/v1
+kind: CapabilityPack
+metadata:
+  id: org.openwork.github
+  name: GitHub
+  version: 1.0.0
+  description: Read repositories and create governed engineering issues.
+provider:
+  type: mcp
+  connector: github
+capabilities:
+  - id: github.repository.read
+    description: Search and read repository metadata.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query: { type: string, maxLength: 1024 }
+        minimal_output: { type: boolean }
+        perPage: { type: integer, minimum: 1, maximum: 100 }
+  - id: github.file.read
+    description: Read one repository file.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [owner, repo, path]
+      properties:
+        owner: { type: string, minLength: 1, maxLength: 128 }
+        repo: { type: string, minLength: 1, maxLength: 128 }
+        path: { type: string, minLength: 1, maxLength: 4096 }
+        ref: { type: string, minLength: 1, maxLength: 256 }
+  - id: github.issue.read
+    description: Read repository issues.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [owner, repo]
+      properties:
+        owner: { type: string, minLength: 1, maxLength: 128 }
+        repo: { type: string, minLength: 1, maxLength: 128 }
+        state: { type: string, enum: [OPEN, CLOSED] }
+        page: { type: integer, minimum: 1 }
+        perPage: { type: integer, minimum: 1, maximum: 100 }
+  - id: github.actions.read
+    description: Read workflow run status and logs.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [owner, repo]
+      properties:
+        owner: { type: string, minLength: 1, maxLength: 128 }
+        repo: { type: string, minLength: 1, maxLength: 128 }
+        page: { type: integer, minimum: 1 }
+        perPage: { type: integer, minimum: 1, maximum: 100 }
+  - id: github.pull_request.read
+    description: Read pull request metadata and checks.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [owner, repo]
+      properties:
+        owner: { type: string, minLength: 1, maxLength: 128 }
+        repo: { type: string, minLength: 1, maxLength: 128 }
+        state: { type: string, enum: [open, closed, all] }
+        page: { type: integer, minimum: 1 }
+        perPage: { type: integer, minimum: 1, maximum: 100 }
+  - id: github.issue.create
+    description: Create one issue after exact approval.
+    risk: L3
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [owner, repo, title, body]
+      properties:
+        owner: { type: string, minLength: 1, maxLength: 128 }
+        repo: { type: string, minLength: 1, maxLength: 128 }
+        title: { type: string, minLength: 1, maxLength: 256 }
+        body: { type: string, minLength: 1, maxLength: 16384 }
+permissions:
+  filesystem:
+    read: []
+    write: []
+  network: restricted
+  credentials: [github.app]

@@ -628,7 +628,7 @@ impl DigestPinnedImageRef {
         let value = value.into();
         if !is_digest_pinned_image(&value) {
             return Err(invalid_contract(
-                "sandbox image must be a valid lowercase OCI name pinned by sha256 digest",
+                "sandbox image must be an OCI name pinned by sha256 digest or a local sha256 image id",
             ));
         }
         Ok(Self(value))
@@ -1689,6 +1689,9 @@ pub fn is_digest_pinned_image(image: &str) -> bool {
     if image.starts_with('-') || image.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return false;
     }
+    if let Some(digest) = image.strip_prefix("sha256:") {
+        return valid_sha256_digest(digest);
+    }
     let Some((name, digest)) = image.rsplit_once("@sha256:") else {
         return false;
     };
@@ -1703,9 +1706,11 @@ pub fn is_digest_pinned_image(image: &str) -> bool {
     } else {
         valid_oci_segment(first)
     };
-    valid_first
-        && segments.all(valid_oci_segment)
-        && digest.len() == 64
+    valid_first && segments.all(valid_oci_segment) && valid_sha256_digest(digest)
+}
+
+fn valid_sha256_digest(digest: &str) -> bool {
+    digest.len() == 64
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -2015,6 +2020,11 @@ mod tests {
             "openwork//sandbox@sha256:{}",
             "a".repeat(64)
         )));
+        assert!(is_digest_pinned_image(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!is_digest_pinned_image("sha256:abcd"));
     }
 
     #[test]

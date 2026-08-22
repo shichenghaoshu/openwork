@@ -1,5 +1,6 @@
 //! Deterministic fixtures and validators for the M1 safe-execution demo.
 
+pub mod office_demo;
 pub mod sales_demo;
 pub mod scenario;
 

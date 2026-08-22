@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand};
+use openwork_apps::importer::{
+    CliAnythingCapabilityDraft, CliAnythingImportRequest, import_cli_anything,
+};
+use openwork_apps::{AppId, AppRegistry, CapabilityId};
 use openwork_config::{
     ChecksumAuthority, LockfileError, LockfileStore, RequestedRuntime, ResolvedRuntime,
     RuntimeChecksum, RuntimeInstallStatus, RuntimeLicense, RuntimeLockEntry, RuntimeLockfile,
     RuntimeSource, RuntimeSourceKind, RuntimeTimestamps, StoragePaths, UpstreamProvenance,
 };
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
-use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
+use openwork_doctor::{CheckStatus, DoctorCheck, DoctorReport, inspect_platform};
 use openwork_e2e::sales_demo::{SalesDemoConfig, SalesDemoReport, run_sales_demo};
 use openwork_execution::{DigestPinnedImageRef, Run};
 use openwork_installer::{
@@ -14,11 +18,15 @@ use openwork_installer::{
 };
 use openwork_platform::{PlatformInfo, PlatformProbe, SystemPlatformProbe, detect};
 use openwork_runtime::{
-    AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, DetectionState, RuntimeCapabilities,
-    RuntimeDetection, RuntimeId, RuntimeInstallPlan, RuntimeMetadata, RuntimeRegistry,
-    SystemCommandRunner, SystemDownloader,
+    AgentRuntime, AuthStatus, ClaudeRuntime, CodexRuntime, DetectionState, OpenCodeRuntime,
+    PiRuntime, RuntimeCapabilities, RuntimeDetection, RuntimeId, RuntimeInstallPlan,
+    RuntimeMetadata, RuntimeRegistry, SystemCommandRunner, SystemDownloader,
 };
+use serde::Deserialize;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -70,6 +78,11 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Inspect and enable administrator-reviewed capability packs.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
     },
     /// Execute a task through a managed runtime in a safe sandbox.
     Run {
@@ -131,6 +144,43 @@ enum RuntimeCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// List capability packs from an administrator-controlled local registry.
+    List {
+        /// Registry directory containing reviewed YAML packs.
+        #[arg(long, default_value = "registry/apps")]
+        registry: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record an app as enabled locally after validating its reviewed manifest.
+    Install {
+        id: String,
+        #[arg(long, default_value = "registry/apps")]
+        registry: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Convert bounded CLI-Anything metadata into a reviewable YAML draft; no install occurs.
+    Import {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "0.1.0")]
+        version: String,
+        #[arg(long, default_value = "Imported CLI-Anything capability pack")]
+        description: String,
+        /// Path to a CLI-Anything SKILL.md used only to enrich missing descriptions.
+        #[arg(long)]
+        skill: PathBuf,
+        /// Capability identifier to include. May be provided more than once.
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+    },
+}
+
 #[derive(Serialize)]
 struct StatusReport {
     schema_version: u32,
@@ -148,6 +198,21 @@ struct RuntimeSummary {
     version: Option<String>,
     auth: AuthStatus,
     capabilities: RuntimeCapabilities,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalAppState {
+    schema_version: u32,
+    installed: BTreeMap<String, LocalInstalledApp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalInstalledApp {
+    enabled: bool,
+    manifest_version: String,
+    recorded_at: String,
 }
 
 struct InstallRequest {
@@ -197,6 +262,7 @@ fn run(cli: Cli, probe: &impl PlatformProbe) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, bool)> {
     match cli.command {
         Command::Install {
@@ -217,7 +283,9 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
         ),
         Command::Status { json } => execute_status(probe, json),
         Command::Doctor { json } => {
-            let report = inspect_platform(&platform(probe, json)?);
+            let host = platform(probe, json)?;
+            let mut report = inspect_platform(&host);
+            append_runtime_doctor_checks(&mut report, &runtime_registry(&host));
             render_doctor(&report, json);
             Ok(if report.has_failures() {
                 ErrorCode::PreflightFailed.exit_code()
@@ -247,6 +315,26 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             }
             Ok(0)
         }
+        Command::App {
+            command: AppCommand::List { registry, json },
+        } => execute_app_list(&registry, json),
+        Command::App {
+            command: AppCommand::Install { id, registry, json },
+        } => {
+            let host = platform(probe, json)?;
+            execute_app_install(&host, &registry, &id, json)
+        }
+        Command::App {
+            command:
+                AppCommand::Import {
+                    id,
+                    name,
+                    version,
+                    description,
+                    skill,
+                    capabilities,
+                },
+        } => execute_app_import(&id, &name, &version, &description, &skill, &capabilities),
         Command::Run {
             runtime,
             workspace,
@@ -258,6 +346,11 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
         } => {
+            if id == "auto" {
+                let summary = auto_runtime_summary();
+                render_runtime_summary(&summary, json);
+                return Ok(0);
+            }
             let host = platform(probe, json)?;
             let registry = runtime_registry(&host);
             let runtime = registry.get(&RuntimeId::from(id.as_str())).ok_or_else(|| {
@@ -271,24 +364,7 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
                 )
             })?;
             let summary = runtime_summary(runtime.as_ref()).map_err(|error| (error, json))?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&summary).unwrap_or_default()
-                );
-            } else {
-                println!("Runtime: {}", summary.metadata.name);
-                println!("State: {:?}", summary.detection.state);
-                println!(
-                    "Version: {}",
-                    summary.version.as_deref().unwrap_or("unknown")
-                );
-                println!("Auth: {:?}", summary.auth);
-                println!("Distribution: {:?}", summary.metadata.distribution);
-                if let Some(details) = &summary.detection.details {
-                    println!("Details: {details}");
-                }
-            }
+            render_runtime_summary(&summary, json);
             Ok(0)
         }
     }
@@ -311,6 +387,219 @@ fn execute_status(probe: &impl PlatformProbe, json: bool) -> Result<u8, (OpenWor
     };
     render_status(&report, json);
     Ok(0)
+}
+
+fn execute_app_list(registry_path: &Path, json: bool) -> Result<u8, (OpenWorkError, bool)> {
+    let registry = AppRegistry::load(registry_path).map_err(|error| (error, json))?;
+    let apps = registry.list();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&apps).unwrap_or_else(|_| "[]".to_owned())
+        );
+    } else {
+        for app in apps {
+            println!(
+                "{}\t{}\t{}\t{} capabilities",
+                app.metadata.id.as_str(),
+                app.metadata.version,
+                app.metadata.name,
+                app.capabilities.len()
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn execute_app_install(
+    host: &PlatformInfo,
+    registry_path: &Path,
+    requested_id: &str,
+    json: bool,
+) -> Result<u8, (OpenWorkError, bool)> {
+    let id = AppId::parse(requested_id).map_err(|error| (error, json))?;
+    let registry = AppRegistry::load(registry_path).map_err(|error| (error, json))?;
+    let app = registry.get(&id).ok_or_else(|| {
+        (
+            OpenWorkError::new(
+                ErrorCode::ConfigInvalid,
+                format!("app `{requested_id}` is not present in the reviewed local registry"),
+            )
+            .with_remediation(
+                "Run `openwork app list` and ask an administrator to add a reviewed pack.",
+            ),
+            json,
+        )
+    })?;
+    let remote_install = install_app_in_control_api(id.as_str()).map_err(|error| (error, json))?;
+    let path = local_app_state_path(host);
+    let mut state = read_local_app_state(&path).map_err(|error| (error, json))?;
+    state.schema_version = 1;
+    state.installed.insert(
+        id.as_str().to_owned(),
+        LocalInstalledApp {
+            enabled: true,
+            manifest_version: app.metadata.version.clone(),
+            recorded_at: current_timestamp(),
+        },
+    );
+    write_local_app_state(&path, &state).map_err(|error| (error, json))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "app_id": id,
+                "enabled": true,
+                "state_path": path,
+                "remote_install": remote_install,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Enabled {} from the local reviewed registry.",
+            app.metadata.name
+        );
+        println!("State: {}", path.display());
+        if remote_install {
+            println!(
+                "The running Control API enabled this App; credentials remain server-managed."
+            );
+        } else {
+            println!("No Control API was configured; only local reviewed state was recorded.");
+        }
+    }
+    Ok(0)
+}
+
+fn install_app_in_control_api(app_id: &str) -> Result<bool, OpenWorkError> {
+    let base_url = env::var("OPENWORK_CONTROL_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let token = env::var("OPENWORK_CONTROL_API_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (base_url, token) = match (base_url, token) {
+        (Some(base_url), Some(token)) => (base_url, token),
+        (None, None) => return Ok(false),
+        _ => {
+            return Err(OpenWorkError::new(
+                ErrorCode::ConfigInvalid,
+                "both Control API URL and token are required for remote App installation",
+            ));
+        }
+    };
+    let endpoint = format!(
+        "{}/v1/apps/{app_id}/install",
+        base_url.trim_end_matches('/')
+    );
+    let url = reqwest::Url::parse(&endpoint)
+        .map_err(|_| OpenWorkError::new(ErrorCode::ConfigInvalid, "Control API URL is invalid"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(OpenWorkError::new(
+            ErrorCode::ConfigInvalid,
+            "Control API URL must use HTTP or HTTPS",
+        ));
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| client.post(url).bearer_auth(token).send())
+        .map_err(|_| {
+            OpenWorkError::new(ErrorCode::Io, "Control API App installation request failed")
+        })?;
+    if !response.status().is_success() {
+        return Err(OpenWorkError::new(
+            ErrorCode::ConfigInvalid,
+            "Control API rejected App installation",
+        ));
+    }
+    Ok(true)
+}
+
+fn execute_app_import(
+    id: &str,
+    name: &str,
+    version: &str,
+    description: &str,
+    skill_path: &Path,
+    capability_ids: &[String],
+) -> Result<u8, (OpenWorkError, bool)> {
+    let skill = fs::read_to_string(skill_path).map_err(|_| {
+        (
+            OpenWorkError::new(
+                ErrorCode::ConfigInvalid,
+                "CLI-Anything SKILL file is unreadable",
+            ),
+            false,
+        )
+    })?;
+    let capabilities = capability_ids
+        .iter()
+        .map(|capability| {
+            CapabilityId::parse(capability).map(|id| CliAnythingCapabilityDraft {
+                description: String::new(),
+                id,
+                risk: openwork_execution::RiskLevel::LocalWrite,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| (error, false))?;
+    let pack = import_cli_anything(
+        CliAnythingImportRequest {
+            app_id: AppId::parse(id).map_err(|error| (error, false))?,
+            name: name.to_owned(),
+            version: version.to_owned(),
+            description: description.to_owned(),
+            capabilities,
+        },
+        &skill,
+    )
+    .map_err(|error| (error, false))?;
+    let yaml = yaml_serde::to_string(&pack).map_err(|_| {
+        (
+            OpenWorkError::new(
+                ErrorCode::ConfigInvalid,
+                "CLI-Anything draft could not be encoded",
+            ),
+            false,
+        )
+    })?;
+    print!("{yaml}");
+    Ok(0)
+}
+
+fn local_app_state_path(host: &PlatformInfo) -> PathBuf {
+    host.paths.data.join("apps.installed.json")
+}
+
+fn read_local_app_state(path: &Path) -> Result<LocalAppState, OpenWorkError> {
+    if !path.exists() {
+        return Ok(LocalAppState::default());
+    }
+    let input = fs::read(path).map_err(|_| {
+        OpenWorkError::new(ErrorCode::ConfigInvalid, "local app state is unreadable")
+    })?;
+    let state = serde_json::from_slice(&input)
+        .map_err(|_| OpenWorkError::new(ErrorCode::ConfigInvalid, "local app state is invalid"))?;
+    Ok(state)
+}
+
+fn write_local_app_state(path: &Path, state: &LocalAppState) -> Result<(), OpenWorkError> {
+    let parent = path.parent().ok_or_else(|| {
+        OpenWorkError::new(
+            ErrorCode::ConfigInvalid,
+            "local app state path has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|_| {
+        OpenWorkError::new(ErrorCode::Io, "local app state directory is unavailable")
+    })?;
+    let payload = serde_json::to_vec_pretty(state).map_err(|_| {
+        OpenWorkError::new(ErrorCode::ConfigInvalid, "local app state could not encode")
+    })?;
+    fs::write(path, payload)
+        .map_err(|_| OpenWorkError::new(ErrorCode::Io, "local app state could not be recorded"))
 }
 
 fn execute_install(
@@ -583,8 +872,10 @@ fn execute_run(
     json: bool,
 ) -> Result<u8, (OpenWorkError, bool)> {
     let workspace_path = Path::new(workspace);
-    if !matches!(runtime, "claude-code" | "codex")
-        || prompt.is_empty()
+    if !matches!(
+        runtime,
+        "auto" | "claude-code" | "codex" | "opencode" | "pi"
+    ) || prompt.is_empty()
         || workspace_path.is_absolute()
         || !workspace_path.is_dir()
     {
@@ -851,6 +1142,14 @@ fn runtime_registry(host: &PlatformInfo) -> RuntimeRegistry {
         )))
         .expect("built-in runtime ids are unique");
     registry
+        .register(Arc::new(OpenCodeRuntime::new(Arc::new(
+            SystemCommandRunner,
+        ))))
+        .expect("built-in runtime ids are unique");
+    registry
+        .register(Arc::new(PiRuntime::new(Arc::new(SystemCommandRunner))))
+        .expect("built-in runtime ids are unique");
+    registry
 }
 
 fn normalize_runtime_id(id: &str) -> &str {
@@ -861,16 +1160,110 @@ fn runtime_summaries(
     registry: &RuntimeRegistry,
     json: bool,
 ) -> Result<Vec<RuntimeSummary>, (OpenWorkError, bool)> {
-    registry
-        .metadata()
-        .into_iter()
-        .map(|metadata| {
-            registry
-                .get(&metadata.id)
-                .expect("metadata came from this registry")
-        })
-        .map(|runtime| runtime_summary(runtime.as_ref()).map_err(|error| (error, json)))
-        .collect()
+    let mut summaries = vec![auto_runtime_summary()];
+    summaries.extend(
+        registry
+            .metadata()
+            .into_iter()
+            .map(|metadata| {
+                registry
+                    .get(&metadata.id)
+                    .expect("metadata came from this registry")
+            })
+            .map(|runtime| runtime_summary(runtime.as_ref()).map_err(|error| (error, json)))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    Ok(summaries)
+}
+
+fn auto_runtime_summary() -> RuntimeSummary {
+    RuntimeSummary {
+        metadata: RuntimeMetadata {
+            id: RuntimeId::from("auto"),
+            name: "Auto".to_owned(),
+            upstream: "https://github.com/shichenghaoshu/openwork".to_owned(),
+            license: "Apache-2.0".to_owned(),
+            distribution: openwork_runtime::DistributionModel::Embedded,
+        },
+        detection: RuntimeDetection {
+            state: DetectionState::Healthy,
+            executable: None,
+            details: Some(
+                "Built-in policy router; selects an eligible configured runtime.".to_owned(),
+            ),
+        },
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        auth: AuthStatus::Unknown,
+        capabilities: RuntimeCapabilities {
+            install: false,
+            uninstall: false,
+            update: false,
+            authenticate: false,
+            run: true,
+            cancel: false,
+        },
+    }
+}
+
+fn append_runtime_doctor_checks(report: &mut DoctorReport, registry: &RuntimeRegistry) {
+    report.checks.push(DoctorCheck {
+        id: "runtime.auto".to_owned(),
+        status: CheckStatus::Pass,
+        summary: "Auto routing is available".to_owned(),
+        details: None,
+        remediation: None,
+    });
+    for metadata in registry.metadata() {
+        let runtime = registry
+            .get(&metadata.id)
+            .expect("metadata came from this registry");
+        let detection = match runtime.detect() {
+            Ok(value) => value,
+            Err(error) => RuntimeDetection {
+                state: DetectionState::Broken,
+                executable: None,
+                details: Some(error.to_string()),
+            },
+        };
+        let (status, remediation) = match detection.state {
+            DetectionState::Healthy => (CheckStatus::Pass, None),
+            DetectionState::Missing => (
+                CheckStatus::Skip,
+                Some("Install this externally managed runtime using its official upstream instructions.".to_owned()),
+            ),
+            DetectionState::Broken => (
+                CheckStatus::Warn,
+                Some("Repair this externally managed runtime using its official upstream instructions.".to_owned()),
+            ),
+        };
+        report.checks.push(DoctorCheck {
+            id: format!("runtime.{}", metadata.id),
+            status,
+            summary: format!("{} is {:?}", metadata.name, detection.state),
+            details: detection.details,
+            remediation,
+        });
+    }
+    report.summary.pass = report
+        .checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Pass)
+        .count();
+    report.summary.warn = report
+        .checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Warn)
+        .count();
+    report.summary.fail = report
+        .checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Fail)
+        .count();
+    report.summary.skip = report
+        .checks
+        .iter()
+        .filter(|check| check.status == CheckStatus::Skip)
+        .count();
 }
 
 fn runtime_summary(runtime: &dyn AgentRuntime) -> Result<RuntimeSummary, OpenWorkError> {
@@ -882,6 +1275,27 @@ fn runtime_summary(runtime: &dyn AgentRuntime) -> Result<RuntimeSummary, OpenWor
         auth: runtime.auth_status()?,
         capabilities: runtime.capabilities(),
     })
+}
+
+fn render_runtime_summary(summary: &RuntimeSummary, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(summary).unwrap_or_default()
+        );
+    } else {
+        println!("Runtime: {}", summary.metadata.name);
+        println!("State: {:?}", summary.detection.state);
+        println!(
+            "Version: {}",
+            summary.version.as_deref().unwrap_or("unknown")
+        );
+        println!("Auth: {:?}", summary.auth);
+        println!("Distribution: {:?}", summary.metadata.distribution);
+        if let Some(details) = &summary.detection.details {
+            println!("Details: {details}");
+        }
+    }
 }
 
 fn platform(probe: &impl PlatformProbe, json: bool) -> Result<PlatformInfo, (OpenWorkError, bool)> {

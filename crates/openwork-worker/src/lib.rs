@@ -9,7 +9,12 @@ use openwork_execution::{
     SandboxBackend, SandboxLimits, SandboxNetworkPolicy, SandboxResult, SandboxTermination,
     SandboxUser, SandboxWorkingDirectory, Sha256Digest, UtcTimestamp,
 };
-use openwork_runtime::task::{RuntimeTaskAdapter, decode_sandbox_result, into_sandbox_request};
+use openwork_runtime::task::{
+    CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, ClaudeTaskAdapter, CodexTaskAdapter, OPENCODE_RUNTIME_ID,
+    OpenCodeTaskAdapter, PI_RUNTIME_ID, PiTaskAdapter, RuntimeTaskAdapter, decode_sandbox_result,
+    into_sandbox_request,
+};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
@@ -45,6 +50,174 @@ pub struct WorkerTaskSpec {
     pub working_directory: SandboxWorkingDirectory,
     pub timeout_seconds: u64,
     pub capabilities: Vec<String>,
+}
+
+/// Durable runtime selector value for a run which delegates provider selection
+/// to a configured worker. It never causes discovery or execution on the host.
+pub const AUTO_RUNTIME_ID: &str = "auto";
+
+/// The explicitly configured in-container executable for each supported runtime.
+/// A missing value means that runtime is unavailable to this worker.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeExecutableConfig {
+    pub claude_code: Option<String>,
+    pub codex: Option<String>,
+    pub opencode: Option<String>,
+    pub pi: Option<String>,
+}
+
+impl RuntimeExecutableConfig {
+    /// Returns configured runtime identifiers in deterministic Auto preference order.
+    #[must_use]
+    pub fn available_in_auto_order(&self) -> Vec<&'static str> {
+        // Prefer the mature, configured coding runtimes first. The order is
+        // intentionally static so users can explain why Auto selected one.
+        [
+            (CODEX_RUNTIME_ID, self.codex.is_some()),
+            (CLAUDE_RUNTIME_ID, self.claude_code.is_some()),
+            (OPENCODE_RUNTIME_ID, self.opencode.is_some()),
+            (PI_RUNTIME_ID, self.pi.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(runtime, enabled)| enabled.then_some(runtime))
+        .collect()
+    }
+}
+
+/// The immutable, auditable result of choosing a worker runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSelection {
+    pub requested_runtime: String,
+    pub selected_runtime: String,
+    pub rationale: &'static str,
+}
+
+/// Selects an explicitly configured runtime without probing a host executable.
+///
+/// Auto uses Codex, Claude Code, `OpenCode`, then Pi. Explicit selections must
+/// be configured and never silently fall back to another provider.
+///
+/// # Errors
+///
+/// Returns a fail-closed error for an unknown or unavailable runtime.
+pub fn select_runtime(
+    requested_runtime: &str,
+    configured: &RuntimeExecutableConfig,
+) -> Result<RuntimeSelection, OpenWorkError> {
+    if requested_runtime == AUTO_RUNTIME_ID {
+        let selected_runtime = configured
+            .available_in_auto_order()
+            .into_iter()
+            .next()
+            .ok_or_else(|| worker_error("Auto runtime has no configured in-container provider"))?;
+        return Ok(RuntimeSelection {
+            requested_runtime: AUTO_RUNTIME_ID.to_owned(),
+            selected_runtime: selected_runtime.to_owned(),
+            rationale: "auto priority: codex, claude-code, opencode, pi",
+        });
+    }
+    let available = match requested_runtime {
+        CODEX_RUNTIME_ID => configured.codex.is_some(),
+        CLAUDE_RUNTIME_ID => configured.claude_code.is_some(),
+        OPENCODE_RUNTIME_ID => configured.opencode.is_some(),
+        PI_RUNTIME_ID => configured.pi.is_some(),
+        _ => {
+            return Err(worker_error(
+                "claimed runtime is not supported by the worker",
+            ));
+        }
+    };
+    if !available {
+        return Err(worker_error(
+            "claimed runtime is not configured for this worker",
+        ));
+    }
+    Ok(RuntimeSelection {
+        requested_runtime: requested_runtime.to_owned(),
+        selected_runtime: requested_runtime.to_owned(),
+        rationale: "explicit runtime selection",
+    })
+}
+
+/// A sandbox-only adapter router. It owns only fixed in-container executable
+/// paths; prompts continue to reach each provider solely on stdin.
+pub struct WorkerRuntimeRouter {
+    configured: RuntimeExecutableConfig,
+    adapters: BTreeMap<String, Box<dyn RuntimeTaskAdapter>>,
+}
+
+impl WorkerRuntimeRouter {
+    /// Creates adapters for only explicitly configured container executables.
+    #[must_use]
+    pub fn new(configured: RuntimeExecutableConfig) -> Self {
+        let mut adapters: BTreeMap<String, Box<dyn RuntimeTaskAdapter>> = BTreeMap::new();
+        if let Some(executable) = &configured.codex {
+            adapters.insert(
+                CODEX_RUNTIME_ID.to_owned(),
+                Box::new(CodexTaskAdapter::new(executable.clone())),
+            );
+        }
+        if let Some(executable) = &configured.claude_code {
+            adapters.insert(
+                CLAUDE_RUNTIME_ID.to_owned(),
+                Box::new(ClaudeTaskAdapter::new(executable.clone())),
+            );
+        }
+        if let Some(executable) = &configured.opencode {
+            adapters.insert(
+                OPENCODE_RUNTIME_ID.to_owned(),
+                Box::new(OpenCodeTaskAdapter::new(executable.clone())),
+            );
+        }
+        if let Some(executable) = &configured.pi {
+            adapters.insert(
+                PI_RUNTIME_ID.to_owned(),
+                Box::new(PiTaskAdapter::new(executable.clone())),
+            );
+        }
+        Self {
+            configured,
+            adapters,
+        }
+    }
+
+    /// Resolves a durable run runtime and produces the adapter task spec.
+    /// The caller must retain the returned selection in its run/audit boundary.
+    /// This worker layer refuses to make Auto an implicit provider command.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the task differs from the claimed runtime or when no
+    /// configured adapter can satisfy that runtime.
+    pub fn resolve_task_spec(
+        &self,
+        lease: &RunLease,
+        mut spec: WorkerTaskSpec,
+    ) -> Result<(RuntimeSelection, WorkerTaskSpec), OpenWorkError> {
+        if spec.runtime != lease.run.runtime {
+            return Err(worker_error("task spec runtime does not match claimed run"));
+        }
+        let selection = select_runtime(&lease.run.runtime, &self.configured)?;
+        spec.runtime.clone_from(&selection.selected_runtime);
+        Ok((selection, spec))
+    }
+}
+
+impl WorkerRuntimeRouter {
+    /// Gets the concrete sandbox adapter after a successful selection.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the supplied selection is no longer configured.
+    pub fn adapter(
+        &self,
+        selection: &RuntimeSelection,
+    ) -> Result<&dyn RuntimeTaskAdapter, OpenWorkError> {
+        self.adapters
+            .get(&selection.selected_runtime)
+            .map(Box::as_ref)
+            .ok_or_else(|| worker_error("selected runtime adapter is unavailable"))
+    }
 }
 
 /// A worker request contains no serializable prompt-bearing field.
@@ -219,14 +392,19 @@ pub enum WorkerOutcome {
 
 /// Minimal single-run worker. It makes no host runtime invocation: adapters
 /// construct a sandbox command and prompt stdin, then the backend executes it.
-pub struct SingleRunWorker<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter> {
+pub struct SingleRunWorker<
+    'a,
+    S: WorkerLeaseStore,
+    B: SandboxBackend,
+    A: RuntimeTaskAdapter + ?Sized,
+> {
     store: &'a S,
     sandbox: &'a B,
     adapter: &'a A,
     supervisor: SupervisorConfig,
 }
 
-impl<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter>
+impl<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter + ?Sized>
     SingleRunWorker<'a, S, B, A>
 {
     #[must_use]
@@ -584,12 +762,21 @@ fn build_task(
         capabilities: spec.capabilities,
     };
     task.validate()?;
-    if task.prompt_hash != lease.run.prompt_sha256 || task.runtime != lease.run.runtime {
+    let runtime_matches = task.runtime == lease.run.runtime
+        || (lease.run.runtime == AUTO_RUNTIME_ID && is_supported_runtime(&task.runtime));
+    if task.prompt_hash != lease.run.prompt_sha256 || !runtime_matches {
         return Err(worker_error(
             "one-time prompt hash or runtime does not match claimed run",
         ));
     }
     Ok(task)
+}
+
+fn is_supported_runtime(runtime: &str) -> bool {
+    matches!(
+        runtime,
+        CODEX_RUNTIME_ID | CLAUDE_RUNTIME_ID | OPENCODE_RUNTIME_ID | PI_RUNTIME_ID
+    )
 }
 
 fn validate_environment(
@@ -885,6 +1072,29 @@ mod tests {
                 })
             ));
         });
+    }
+
+    #[test]
+    fn auto_selection_uses_configured_priority_and_explicit_never_falls_back() {
+        let configured = RuntimeExecutableConfig {
+            claude_code: Some("/opt/claude".to_owned()),
+            codex: None,
+            opencode: Some("/opt/opencode".to_owned()),
+            pi: Some("/opt/pi".to_owned()),
+        };
+        let auto = select_runtime(AUTO_RUNTIME_ID, &configured).expect("auto selection");
+        assert_eq!(auto.selected_runtime, CLAUDE_RUNTIME_ID);
+        assert_eq!(
+            auto.rationale,
+            "auto priority: codex, claude-code, opencode, pi"
+        );
+        assert!(select_runtime(CODEX_RUNTIME_ID, &configured).is_err());
+        assert_eq!(
+            select_runtime(OPENCODE_RUNTIME_ID, &configured)
+                .expect("explicit selection")
+                .selected_runtime,
+            OPENCODE_RUNTIME_ID
+        );
     }
 
     fn actor() -> ActorId {

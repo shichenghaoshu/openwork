@@ -1,131 +1,95 @@
 # OpenWork current state
 
-This document is the single status source for the repository. Claims below are
-scoped by evidence level and were last refreshed on 2026-08-22.
+This is the repository's evidence-scoped status source. It was refreshed on
+2026-08-23 for the App Platform integration.
 
 ## Working
 
-- `openwork demo sales` runs the deterministic July/August sales analysis in a
-  digest-pinned, hardened container, scans the two artifacts, verifies their
-  golden bytes and hashes, records the audit chain, and reports `Succeeded`.
-- The reusable sales runner uses `SystemDockerCli`, `DockerSandbox`, and
-  `ExecutionOrchestrator`; input mounts are read-only and the analyzer is
-  invoked as an executable plus fixed arguments without a shell.
-- Docker execution starts without blocking on provider stdin. A separate
-  attach worker delivers bounded stdin while timeout and cancellation polling
-  remain active; timeout, cancel, and transport failure kill and clean up the
-  container.
-- Runtime task adapters prepare Claude Code and Codex invocations with the
-  prompt on stdin rather than argv. Strict JSONL decoding validates run IDs,
-  event sequences, output bounds, terminal events, truncation, and exit state.
-- The execution store has in-memory and Postgres implementations. Postgres
-  persists runs, approvals, single-use action claims, artifacts, and hash-chain
-  audit events with CAS revisions and transactional state changes.
-- The authenticated Control API persists run creation, reads runs/events/
-  artifacts/approvals, and performs approval, denial, and cancellation requests
-  with trusted server time and actor identity. Unleased queued or
-  awaiting-approval runs cancel immediately; active work records an intent and
-  returns `202` without claiming a terminal state.
-- The execution store provides database-mediated worker leases with random
-  capability tokens, bounded heartbeats, deterministic claim ordering, and
-  fail-closed expiry. Only a current lease plus a validated cancelled sandbox
-  result and successful cleanup can confirm terminal `Cancelled`.
-- Startup recovery fails expired leases and unleased orphaned `Planning` or
-  `Running` runs while preserving valid leases. M1 has no `Cancelling` state;
-  the durable cancellation intent is separate from the public run status.
-- The in-process worker claims queued runs, retrieves a digest-bound one-time
-  prompt, drives the configured adapter and container sandbox, heartbeats its
-  lease, observes cancellation intent, records bounded runtime/artifact audit,
-  and completes through lease-bound repository methods. Missing prompts after
-  restart fail closed instead of being persisted in plaintext.
-- An enabled provider worker requires an explicitly named, operator-provisioned
-  container network; it never falls back to Docker default or host networking.
-  Deployments must enforce provider-only egress on that dedicated network.
-- Policy tests cover automatic filesystem read/write, exact-bound L3
-  `email.send` approval, single-use claim consumption, replay and parameter
-  tampering rejection, and direct L4 `database.delete` denial.
-- `ActionExecutor` accepts only a repository-verified `ClaimedAction`.
-  `MockActionExecutor` provides side-effect-free, action-ID-idempotent M1
-  execution and records an `action_executed` audit event.
-- Docker and Podman share one hardened container policy builder through a
-  sealed engine adapter. Docker remains the real M1 backend; Podman reports its
-  host-dependent capabilities rather than implying parity.
-- Compose starts a non-root, read-only Control API with a read-only workspace
-  mount and a digest-pinned Postgres service. The service runs migrations and
-  recovery before listening.
-- Employee Workspace provides task creation/polling/cancellation, approval
-  decisions, and connector discovery through a fixed Electron IPC allowlist;
-  the renderer never receives the Control API token.
-- The Control API owns read-only GitHub and Feishu/Lark MCP discovery. It
-  returns redacted tool metadata and schema digests, caches successful probes
-  for 60 seconds, and does not expose a `tools/call` route.
-
-## Tested
-
-- Workspace formatting, locked checking, strict Clippy, all-target tests, and
-  release build pass locally.
-- The default workspace suite exercises runtime decoding, sandbox lifecycle,
-  artifact/path safety, policy, approval binding/replay, audit integrity,
-  orchestrator terminal states, Control API fail-closed behavior, and the M1
-  control-plane scenario.
-- Real-Postgres tests exercise approve-versus-deny, consume-versus-consume,
-  cancel-versus-complete, queue claim ownership, cancellation confirmation,
-  lease expiry, revision races, and selective/idempotent crash recovery.
-- CI includes a real Docker daemon sales test and a real Postgres concurrency
-  job. Compose CI builds and starts the deployed services, checks health,
-  creates an authenticated run, verifies prompt omission, and reads its genesis
-  audit event.
-- CI now runs actual CodeQL analysis and scans the built Control API image for
-  critical vulnerabilities instead of using placeholder or duplicate checks.
+- Employee Workspace has Workspace, Tasks, Files, Apps, and Approvals, plus
+  administrator Runtime, App Store, and Settings views. Its Electron renderer
+  receives neither the Control API bearer token nor an arbitrary HTTP bridge.
+- Uploaded files are content-addressed, bounded to 8 MiB, selected by exact ID,
+  copied into a root-bounded workspace input directory, and presented to the
+  sandbox as read-only task inputs.
+- Runtime selection supports `auto`, `claude-code`, `codex`, `opencode`, and
+  `pi`. Auto deterministically chooses the first configured provider in the
+  order Codex, Claude Code, OpenCode, Pi; explicit selections never fall back.
+- OpenCode uses `opencode run --format json`; Pi uses `pi --mode rpc
+  --no-session`. Both prompts travel on stdin, their JSONL outputs are bounded
+  and decoded into OpenWork runtime events, and production execution remains in
+  the configured container sandbox.
+- Capability Pack v1, the App Registry, exact capability grants, policy
+  decisions, opaque authorization, single-use approved action claims, and
+  scoped credential-provider boundaries are implemented.
+- GitHub is a reviewed App with exact mappings for repository search, file,
+  issue, workflow-run, and pull-request reads. `github.issue.create` is L3: the
+  HTTP request creates an exact-bound durable approval, and execution accepts
+  only the consumed claim. There is no `approved=true` bypass or arbitrary MCP
+  tool-name route.
+- External GitHub execution reserves the action before the remote call and
+  refuses replay. An ambiguous remote result remains fail-closed instead of
+  retrying a potentially completed side effect.
+- Feishu/Lark discovery is configured through the official pinned stdio MCP
+  package and an exact read-only tool allowlist. No write capability is exposed.
+- The CLI provider accepts only a gateway authorization, sends dynamic
+  parameters through bounded stdin, runs with network disabled, and exposes no
+  host shell path. The CLI-Anything importer treats SKILL.md as documentation,
+  not as trusted permissions or executable policy.
+- The LibreOffice App image pins the official CLI-Anything source revision,
+  runs LibreOffice headless with a fixed adapter, and produces scanned XLSX and
+  PPTX artifacts in a hardened, network-disabled container.
+- `openwork runtime list/info`, `openwork app list/install/import`, and
+  `openwork doctor` expose the runtime and reviewed local App inventory.
+- Postgres worker leases, heartbeat, cancellation intent/evidence, recovery,
+  approvals, artifacts, and hash-chain audit remain the durable execution base.
 
 ## Real-host verified
 
-- macOS arm64 with Docker Server 29.2.0: the digest-pinned BusyBox sales
-  container completed, produced byte-identical CSV/Markdown artifacts, passed
-  artifact hashing and audit verification, and cleaned up.
-- macOS arm64 with a real PostgreSQL 17.6 container: all ten transaction-race,
-  queue-lease, cancellation, expiry, and recovery tests passed.
-- macOS arm64 Compose: migrations 1 through 4 applied; Postgres and the Control
-  API became healthy; an authenticated queued run persisted without returning
-  its prompt, then cancelled immediately with `cancel_confirmed` audit evidence.
-- `scripts/demo-m1.sh` completed Doctor, the real-container sales demo, and both
-  policy/approval/action control-plane scenarios without sending external
-  email.
-- The official digest-pinned GitHub MCP Server completed a real stdio MCP
-  initialize and read-only `tools/list` through the OpenWork connector client.
+- macOS arm64 with Docker Server 29.2.0: a locally built content-addressed
+  LibreOffice App image completed the governed office-bundle path and generated
+  a real spreadsheet and presentation. Both artifacts were scanned and the run
+  finished `Succeeded`.
+- The official digest-pinned GitHub MCP Server completed real initialize,
+  `tools/list`, and a governed repository-read call using an authenticated local
+  credential without returning the credential.
+- A disposable PostgreSQL 17 instance and the real Control API completed an
+  L3 approval flow and created
+  [GitHub issue #105](https://github.com/shichenghaoshu/openwork/issues/105).
+  The durable run reached `Succeeded` with approval-requested, approved,
+  consumed, action-executed, and run-completed audit events.
+- The pre-existing real Docker sales demo and Postgres transaction/lease suites
+  remain available as separate execution-control evidence.
 
-## Fixture only
+## Contract or fixture verified only
 
-- Claude Code and Codex adapter commands, stdin routing, and provider event
-  decoders are fixture-tested. A default-ignored, explicit-auth `HostOnly`
-  harness can exercise a locally installed provider CLI with bounded output and
-  a cleared environment, but no real provider task was invoked during this
-  checkpoint and this is not production-sandbox evidence.
-- Podman command routing and hardened-argument equivalence are fixture-tested;
-  no real Podman host lifecycle has been run.
-- Tier-1 macOS x64, Linux x64/arm64, and Windows Server 2025 x64 compatibility
-  is CI evidence. It is not evidence for Windows 11, WSL, or arbitrary desktop
-  distributions.
-- The external-action path ends at `MockActionExecutor`; no email, ERP, CRM, or
-  other connector is enabled.
-- Feishu/Lark MCP startup and its exact read-only tool allowlist are wired, but
-  no tenant credentials were available for a real account probe.
+- OpenCode and Pi detection, command construction, stdin routing, event
+  decoding, Auto routing, and worker integration compile and pass their focused
+  tests. No authenticated OpenCode or Pi model task was run in this checkpoint.
+- Feishu/Lark startup and allowlist configuration are implemented, but no tenant
+  credential was available for a live account probe.
+- The LibreOffice proof exercises the exact Pi-shaped structured office plan
+  through the Capability Gateway and sandbox, but it does not prove a live Pi
+  provider generated that plan.
+- Podman lifecycle routing is fixture-tested; the App Platform proof used Docker.
 
-## Missing
+## Known production gaps
 
-- A credential-gated real Claude Code or Codex execution image and an actual
-  provider run. The checked-in host probe is optional and was not invoked.
-- Real Podman host validation and durable production idempotency for a real
-  external-action executor.
-- Governed MCP `tools/call`: exact ActionClaim consumption, scoped credential
-  brokering, bounded result redaction, and connector audit are still required
-  before any runtime may invoke GitHub or Feishu actions.
-- Durable encrypted prompt recovery. The current one-time prompt handoff is
-  process-local and intentionally fails queued work after a control-plane
-  restart.
-
-## Blockers
-
-- Enterprise pilot readiness additionally requires provider-image provenance,
-  real provider and Feishu tenant validation, operational credential brokering,
-  deployment observability, backup/restore, and an external security review.
+- Runtime provider images must still be built, provenance-checked, digest-pinned,
+  supplied with their provider authentication, and validated in the target
+  deployment. OpenWork deliberately does not run these CLIs directly on the host.
+- The current GitHub credential source is a scoped token supplied by the
+  operator. A GitHub App installation/OAuth lifecycle and installation-token
+  rotation are not yet implemented.
+- Installed/enabled App state and the default Runtime setting are process-local;
+  reviewed manifests and external capability actions are durable, but those
+  administrator preferences need a database migration before multi-instance use.
+- Prompt handoff is one-time and process-local, so restart loses undelivered
+  prompt material and the worker fails closed. Durable encrypted prompt recovery
+  remains a pilot-readiness requirement.
+- The external action reservation provides replay refusal and at-most-once
+  behavior. A crash between remote success and local reconciliation is reported
+  as uncertain; it cannot provide universal exactly-once semantics without an
+  upstream idempotency key.
+- Enterprise pilot readiness still requires target-provider and Feishu live
+  validation, secret-store integration, deployment observability, backup/restore,
+  and external security review.

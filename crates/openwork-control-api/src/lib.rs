@@ -5,18 +5,25 @@ mod worker_runtime;
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Extension, Path, State},
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use openwork_apps::{
+    AppId, AppProvider, AppRegistry, AvailableApp, CapabilityDescriptor, InstalledApp,
+};
 use openwork_core::ErrorCode;
 use openwork_execution::{
-    ActorId, ApprovalDecision, ApprovalId, ApprovalRequest, DEFAULT_MAX_ARTIFACT_BYTES, Run, RunId,
+    ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
+    ApprovalStatus, DEFAULT_MAX_ARTIFACT_BYTES, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus,
     Sha256Digest, UtcTimestamp,
+    action_executor::{ActionExecutionReceipt, ClaimedAction},
     approval::ApprovalRepository,
     artifact::ArtifactScanner,
+    audit::AuditAppend,
     orchestrator::ExecutionOrchestrator,
     store::{CancelRequest, ExecutionStore, RunQueueRepository, postgres::PostgresExecutionStore},
 };
@@ -36,10 +43,10 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use connector_runtime::{ConnectorRegistry, LookupError};
+use connector_runtime::{CallError, ConnectorRegistry, LookupError};
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const PROMPT_DELIVERY_CAPACITY: usize = 128;
@@ -141,6 +148,26 @@ struct AppState {
     worker_runtimes: Arc<BTreeSet<String>>,
     worker_ready: Arc<AtomicBool>,
     connectors: Arc<ConnectorRegistry>,
+    app_registry: Arc<AppRegistry>,
+    installed_apps: Arc<Mutex<BTreeMap<String, InstalledApp>>>,
+    admin_settings: Arc<Mutex<AdminSettings>>,
+}
+
+const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize)]
+struct AdminSettings {
+    default_runtime: String,
+    max_upload_bytes: usize,
+}
+
+impl Default for AdminSettings {
+    fn default() -> Self {
+        Self {
+            default_runtime: "auto".to_owned(),
+            max_upload_bytes: MAX_UPLOAD_BYTES,
+        }
+    }
 }
 
 struct RouterDependencies {
@@ -654,6 +681,9 @@ fn router_with_dependencies(
         worker_runtimes: Arc::new(dependencies.worker_runtimes),
         worker_ready: dependencies.worker_ready,
         connectors: dependencies.connectors,
+        app_registry: Arc::new(load_app_registry()),
+        installed_apps: Arc::new(Mutex::new(BTreeMap::new())),
+        admin_settings: Arc::new(Mutex::new(AdminSettings::default())),
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -665,14 +695,39 @@ fn router_with_dependencies(
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
+        .route("/approvals/{id}/execute", post(execute_approved_capability))
         .route("/connectors", get(list_connectors))
         .route("/connectors/{id}/tools", get(list_connector_tools))
-        .layer(DefaultBodyLimit::max(256 * 1024))
+        .route("/apps", get(list_apps))
+        .route("/apps/{id}", get(get_app))
+        .route("/apps/{id}/capabilities", get(list_app_capabilities))
+        .route("/apps/{id}/install", post(install_app))
+        .route("/apps/{id}/enable", post(enable_app))
+        .route("/apps/{id}/disable", post(disable_app))
+        .route(
+            "/apps/{id}/capabilities/{capability}/invoke",
+            post(invoke_capability),
+        )
+        .route("/files", get(list_files).post(upload_file))
+        .route("/admin/runtimes", get(list_admin_runtimes))
+        .route(
+            "/admin/settings",
+            get(get_admin_settings).post(update_admin_settings),
+        )
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/health", get(health))
         .nest("/v1", protected)
         .with_state(state)
+}
+
+fn load_app_registry() -> AppRegistry {
+    let directory = env::var_os("OPENWORK_APP_REGISTRY")
+        .map_or_else(|| PathBuf::from("registry/apps"), PathBuf::from);
+    // A missing registry makes every app operation fail closed, while allowing
+    // the control API itself to start for recovery and diagnosis.
+    AppRegistry::load(&directory).unwrap_or_default()
 }
 
 async fn authenticate(
@@ -731,12 +786,509 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+#[derive(Serialize)]
+struct AppResponse<'a> {
+    #[serde(flatten)]
+    app: &'a AvailableApp,
+    installed: bool,
+    enabled: bool,
+}
+
+fn app_response<'a>(state: &AppState, app: &'a AvailableApp) -> Result<AppResponse<'a>, ApiError> {
+    let installs = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let installed = installs.get(app.metadata.id.as_str());
+    Ok(AppResponse {
+        app,
+        installed: installed.is_some(),
+        enabled: installed.is_some_and(|item| item.enabled),
+    })
+}
+
+fn registered_app<'a>(state: &'a AppState, id: &str) -> Result<&'a AvailableApp, ApiError> {
+    let id = AppId::parse(id.to_owned()).map_err(|_| ApiError::invalid("invalid_app_id"))?;
+    state
+        .app_registry
+        .get(&id)
+        .ok_or(ApiError::not_found("app_not_found"))
+}
+
+async fn list_apps(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Value>>, ApiError> {
+    let apps = state
+        .app_registry
+        .list()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let installs = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .clone();
+    Ok(Json(apps.into_iter().map(|app| {
+        let installed = installs.get(app.metadata.id.as_str());
+        json!({"app": app, "installed": installed.is_some(), "enabled": installed.is_some_and(|item| item.enabled)})
+    }).collect()))
+}
+
+async fn get_app(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let app = registered_app(&state, &id)?;
+    let response = app_response(&state, app)?;
+    Ok(Json(
+        json!({"app": response.app, "installed": response.installed, "enabled": response.enabled}),
+    ))
+}
+
+async fn list_app_capabilities(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<CapabilityDescriptor>>, ApiError> {
+    Ok(Json(registered_app(&state, &id)?.capabilities.clone()))
+}
+
+async fn install_app(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let app = registered_app(&state, &id)?;
+    let mut installs = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    installs
+        .entry(app.metadata.id.as_str().to_owned())
+        .or_insert_with(|| InstalledApp {
+            app_id: app.metadata.id.clone(),
+            enabled: true,
+            credential_ref: None,
+        });
+    Ok(Json(
+        json!({"app_id": app.metadata.id, "installed": true, "enabled": true}),
+    ))
+}
+
+fn set_app_enabled(state: &AppState, id: &str, enabled: bool) -> Result<Json<Value>, ApiError> {
+    let app = registered_app(state, id)?;
+    let mut installs = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    let item = installs
+        .get_mut(app.metadata.id.as_str())
+        .ok_or(ApiError::conflict("app_not_installed"))?;
+    item.enabled = enabled;
+    Ok(Json(
+        json!({"app_id": app.metadata.id, "installed": true, "enabled": enabled}),
+    ))
+}
+
+async fn enable_app(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    set_app_enabled(&state, &id, true)
+}
+async fn disable_app(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    set_app_enabled(&state, &id, false)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityInvokeRequest {
+    resource: String,
+    parameters: Value,
+}
+
+async fn invoke_capability(
+    State(state): State<Arc<AppState>>,
+    Path((id, capability)): Path<(String, String)>,
+    Json(request): Json<CapabilityInvokeRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let app = registered_app(&state, &id)?;
+    let descriptor = app
+        .capabilities
+        .iter()
+        .find(|item| item.id.as_str() == capability)
+        .ok_or(ApiError::not_found("capability_not_found"))?;
+    if request.resource.is_empty()
+        || request.resource.len() > 2048
+        || serde_json::to_vec(&request.parameters).map_or(true, |data| data.len() > 64 * 1024)
+    {
+        return Err(ApiError::invalid("invalid_capability_invocation"));
+    }
+    validate_capability_parameters(descriptor, &request.parameters)?;
+    let app_id = app.metadata.id.as_str().to_owned();
+    let capability_id = descriptor.id.as_str().to_owned();
+    let risk = descriptor.risk;
+    let connector = match &descriptor.provider {
+        AppProvider::Mcp { connector } => connector.clone(),
+        _ => return Err(ApiError::unavailable("capability_dispatch_unavailable")),
+    };
+    {
+        let installs = state
+            .installed_apps
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        if !installs.get(&app_id).is_some_and(|item| item.enabled) {
+            return Err(ApiError::conflict("app_not_enabled"));
+        }
+    }
+    if matches!(
+        risk,
+        openwork_execution::RiskLevel::ExternalEffect
+            | openwork_execution::RiskLevel::DestructiveOrFinancial
+    ) {
+        if capability_id != "github.issue.create" || connector != "github" {
+            return Err(ApiError::unavailable("capability_dispatch_unavailable"));
+        }
+        validate_github_issue_create(&request.parameters)?;
+        let actor = ActorId::parse(state.actor_id.clone()).map_err(|_| ApiError::internal())?;
+        let approval = create_capability_approval(
+            &state,
+            actor,
+            &app_id,
+            &capability_id,
+            request.resource,
+            request.parameters,
+        )
+        .await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status":"approval_required",
+                "app_id":app_id,
+                "capability":capability_id,
+                "risk":risk,
+                "run_id":approval.run_id,
+                "approval_id":approval.id,
+                "approval_revision":approval.revision,
+                "expires_at":approval.expires_at
+            })),
+        ));
+    }
+    if connector != "github" {
+        return Err(ApiError::unavailable("capability_dispatch_unavailable"));
+    }
+    let connectors = Arc::clone(&state.connectors);
+    let capability = capability_id.clone();
+    let parameters = request.parameters;
+    let output =
+        tokio::task::spawn_blocking(move || connectors.call_capability(&capability, &parameters))
+            .await
+            .map_err(|_| ApiError::internal())?
+            .map_err(|error| match error {
+                CallError::CapabilityNotMapped => ApiError::not_found("capability_not_mapped"),
+                CallError::InvalidParameters => ApiError::invalid("invalid_capability_parameters"),
+                CallError::NotConfigured => ApiError::unavailable("connector_not_configured"),
+                CallError::Unavailable => ApiError::unavailable("connector_unavailable"),
+            })?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            json!({"status":"completed", "app_id":app_id, "capability":capability_id, "output":output}),
+        ),
+    ))
+}
+
+fn validate_capability_parameters(
+    descriptor: &CapabilityDescriptor,
+    parameters: &Value,
+) -> Result<(), ApiError> {
+    let validator =
+        jsonschema::validator_for(&descriptor.input_schema).map_err(|_| ApiError::internal())?;
+    if !validator.is_valid(parameters) {
+        return Err(ApiError::invalid("invalid_capability_parameters"));
+    }
+    Ok(())
+}
+
+fn validate_github_issue_create(parameters: &Value) -> Result<(), ApiError> {
+    let object = parameters
+        .as_object()
+        .ok_or(ApiError::invalid("invalid_capability_parameters"))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "owner" | "repo" | "title" | "body"))
+        || !["owner", "repo", "title", "body"].iter().all(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        || object
+            .get("owner")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > 128)
+        || object
+            .get("repo")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > 128)
+        || object
+            .get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > 256)
+        || object
+            .get("body")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > 16_384)
+    {
+        return Err(ApiError::invalid("invalid_capability_parameters"));
+    }
+    Ok(())
+}
+
+async fn create_capability_approval(
+    state: &AppState,
+    actor: ActorId,
+    app_id: &str,
+    capability_id: &str,
+    resource: String,
+    parameters: Value,
+) -> Result<ApprovalRequest, ApiError> {
+    let scanner =
+        ArtifactScanner::new(DEFAULT_MAX_ARTIFACT_BYTES).map_err(|_| ApiError::internal())?;
+    let orchestrator = ExecutionOrchestrator::new(state.store.clone(), scanner);
+    let created_at = UtcTimestamp::now();
+    let run = orchestrator
+        .create_run(
+            "capability:github",
+            &state.workspace_root,
+            actor.clone(),
+            "governed capability invocation",
+            created_at,
+        )
+        .map_err(|_| ApiError::internal())?;
+    let planning = state
+        .store
+        .transition_run(
+            &run.id,
+            run.revision,
+            RunStatus::Planning,
+            None,
+            AuditAppend::new(actor.clone(), UtcTimestamp::now()),
+        )
+        .map_err(|_| ApiError::conflict("capability_run_transition_rejected"))?;
+    let awaiting = state
+        .store
+        .transition_run(
+            &planning.id,
+            planning.revision,
+            RunStatus::AwaitingApproval,
+            None,
+            AuditAppend::new(actor.clone(), UtcTimestamp::now()),
+        )
+        .map_err(|_| ApiError::conflict("capability_run_transition_rejected"))?;
+    let action = ActionRequest::new(
+        ActionId::generate(),
+        awaiting.id.clone(),
+        capability_id,
+        resource.clone(),
+        parameters.clone(),
+    )
+    .map_err(|_| ApiError::invalid("invalid_capability_parameters"))?;
+    let approval_id = ApprovalId::generate();
+    let approval_created = OffsetDateTime::now_utc();
+    let approval = ApprovalRequest {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: approval_id.clone(),
+        run_id: awaiting.id.clone(),
+        action_id: action.id.clone(),
+        parameter_hash: action.parameter_hash().clone(),
+        requested_by: actor.clone(),
+        request_reason: format!("{capability_id} requires explicit external-effect approval"),
+        created_at: timestamp_from_offset(approval_created)?,
+        expires_at: timestamp_from_offset(approval_created + time::Duration::hours(1))?,
+        status: ApprovalStatus::Pending,
+        revision: 0,
+        decision: None,
+        consumed_at: None,
+    };
+    let trusted_created_at = approval.created_at;
+    let approval = state
+        .store
+        .create_approval(approval, actor.clone(), trusted_created_at)
+        .map_err(|_| ApiError::conflict("capability_approval_rejected"))?;
+    let inserted = sqlx::query(
+        "INSERT INTO capability_actions(action_id,approval_id,run_id,app_id,capability_id,resource,parameters,parameter_hash,actor_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(Uuid::parse_str(&action.id.to_string()).map_err(|_| ApiError::internal())?)
+    .bind(Uuid::parse_str(&approval_id.to_string()).map_err(|_| ApiError::internal())?)
+    .bind(Uuid::parse_str(&awaiting.id.to_string()).map_err(|_| ApiError::internal())?)
+    .bind(app_id)
+    .bind(capability_id)
+    .bind(resource)
+    .bind(parameters)
+    .bind(action.parameter_hash().as_str())
+    .bind(actor.as_str())
+    .bind(approval_created)
+    .execute(&state.pool)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(ApiError::internal());
+    }
+    Ok(approval)
+}
+
+fn timestamp_from_offset(value: OffsetDateTime) -> Result<UtcTimestamp, ApiError> {
+    value
+        .format(&Rfc3339)
+        .map_err(|_| ApiError::internal())
+        .and_then(|value| UtcTimestamp::parse(value).map_err(|_| ApiError::internal()))
+}
+
+#[derive(Serialize)]
+struct FileEntry {
+    id: String,
+    name: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn uploads_dir(root: &FsPath) -> PathBuf {
+    root.join(".openwork").join("uploads")
+}
+
+async fn list_files(State(state): State<Arc<AppState>>) -> Result<Json<Vec<FileEntry>>, ApiError> {
+    let root = uploads_dir(&state.workspace_root);
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let name = entry.file_name().into_string().ok()?;
+            let (sha256, name) = name.split_once('-')?;
+            if sha256.len() != 64 {
+                return None;
+            }
+            Some(FileEntry {
+                id: format!("{sha256}-{name}"),
+                name: name.to_owned(),
+                bytes: metadata.len(),
+                sha256: sha256.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Json(files))
+}
+
+async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<FileEntry>), ApiError> {
+    let name = headers
+        .get("x-openwork-filename")
+        .and_then(|item| item.to_str().ok())
+        .ok_or(ApiError::invalid("filename_required"))?;
+    if name.is_empty()
+        || name.len() > 128
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(ApiError::invalid("invalid_filename"));
+    }
+    if body.is_empty() || body.len() > MAX_UPLOAD_BYTES {
+        return Err(ApiError::invalid("invalid_file_size"));
+    }
+    let digest = hex_digest(Sha256::digest(&body).into());
+    let root = uploads_dir(&state.workspace_root);
+    fs::create_dir_all(&root).map_err(|_| ApiError::internal())?;
+    let path = root.join(format!("{digest}-{name}"));
+    if !path.starts_with(&root) {
+        return Err(ApiError::invalid("invalid_filename"));
+    }
+    fs::write(&path, &body).map_err(|_| ApiError::internal())?;
+    Ok((
+        StatusCode::CREATED,
+        Json(FileEntry {
+            id: format!("{digest}-{name}"),
+            name: name.to_owned(),
+            bytes: body.len() as u64,
+            sha256: digest,
+        }),
+    ))
+}
+
+#[derive(Serialize)]
+struct RuntimeStatus {
+    id: &'static str,
+    configured: bool,
+    worker_ready: bool,
+}
+
+async fn list_admin_runtimes(State(state): State<Arc<AppState>>) -> Json<Vec<RuntimeStatus>> {
+    Json(
+        ["auto", "claude-code", "codex", "opencode", "pi"]
+            .into_iter()
+            .map(|id| RuntimeStatus {
+                id,
+                configured: (id == "auto" && !state.worker_runtimes.is_empty())
+                    || state.worker_runtimes.contains(id),
+                worker_ready: state.worker_ready.load(Ordering::Acquire)
+                    && ((id == "auto" && !state.worker_runtimes.is_empty())
+                        || state.worker_runtimes.contains(id)),
+            })
+            .collect(),
+    )
+}
+
+async fn get_admin_settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AdminSettings>, ApiError> {
+    state
+        .admin_settings
+        .lock()
+        .map(|settings| Json(settings.clone()))
+        .map_err(|_| ApiError::internal())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateAdminSettings {
+    default_runtime: String,
+}
+async fn update_admin_settings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<UpdateAdminSettings>,
+) -> Result<Json<AdminSettings>, ApiError> {
+    if !matches!(
+        request.default_runtime.as_str(),
+        "auto" | "claude-code" | "codex" | "opencode" | "pi"
+    ) {
+        return Err(ApiError::invalid("invalid_default_runtime"));
+    }
+    let mut settings = state
+        .admin_settings
+        .lock()
+        .map_err(|_| ApiError::internal())?;
+    settings.default_runtime = request.default_runtime;
+    Ok(Json(settings.clone()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRun {
     runtime: String,
     workspace: String,
     prompt: String,
+    #[serde(default)]
+    file_ids: Vec<String>,
 }
 
 async fn create_run(
@@ -747,9 +1299,22 @@ async fn create_run(
     validate_create_run(&request)?;
     let workspace = resolve_workspace(&state.workspace_root, &request.workspace)?;
     if !state.worker_ready.load(Ordering::Acquire)
-        || !state.worker_runtimes.contains(&request.runtime)
+        || (request.runtime == "auto" && state.worker_runtimes.is_empty())
+        || (request.runtime != "auto" && !state.worker_runtimes.contains(&request.runtime))
     {
         return Err(ApiError::unavailable("runtime_worker_unavailable"));
+    }
+    let file_paths =
+        materialize_selected_files(&state.workspace_root, &workspace, &request.file_ids)?;
+    if !file_paths.is_empty() {
+        request
+            .prompt
+            .push_str("\n\nOpenWork input files (read-only sandbox paths):\n");
+        for path in file_paths {
+            request.prompt.push_str("- /workspace/input/");
+            request.prompt.push_str(&path);
+            request.prompt.push('\n');
+        }
     }
     let prompt = SecretBytes::from_string(std::mem::take(&mut request.prompt));
     let trusted_actor = ActorId::parse(actor.0.clone()).map_err(|_| ApiError::internal())?;
@@ -794,9 +1359,13 @@ async fn create_run(
 }
 
 fn validate_create_run(request: &CreateRun) -> Result<(), ApiError> {
-    if !matches!(request.runtime.as_str(), "codex" | "claude-code")
-        || request.prompt.is_empty()
+    if !matches!(
+        request.runtime.as_str(),
+        "auto" | "codex" | "claude-code" | "opencode" | "pi"
+    ) || request.prompt.is_empty()
         || request.prompt.len() > 256 * 1024
+        || request.file_ids.len() > 16
+        || request.file_ids.iter().any(|id| !valid_file_id(id))
     {
         return Err(ApiError::invalid("invalid_run_request"));
     }
@@ -815,6 +1384,76 @@ fn validate_create_run(request: &CreateRun) -> Result<(), ApiError> {
         return Err(ApiError::invalid("invalid_workspace_id"));
     }
     Ok(())
+}
+
+fn valid_file_id(id: &str) -> bool {
+    let Some((digest, name)) = id.split_once('-') else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn materialize_selected_files(
+    workspace_root: &FsPath,
+    workspace: &FsPath,
+    file_ids: &[String],
+) -> Result<Vec<String>, ApiError> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source_root = fs::canonicalize(uploads_dir(workspace_root))
+        .map_err(|_| ApiError::invalid("file_unavailable"))?;
+    let destination = safe_workspace_input_directory(workspace)?;
+    let mut unique = BTreeSet::new();
+    let mut paths = Vec::with_capacity(file_ids.len());
+    for id in file_ids {
+        if !unique.insert(id) {
+            return Err(ApiError::invalid("duplicate_file_id"));
+        }
+        let source = source_root.join(id);
+        let metadata =
+            fs::symlink_metadata(&source).map_err(|_| ApiError::invalid("file_unavailable"))?;
+        if !source.starts_with(&source_root) || !metadata.file_type().is_file() {
+            return Err(ApiError::invalid("file_unavailable"));
+        }
+        fs::copy(&source, destination.join(id)).map_err(|_| ApiError::internal())?;
+        paths.push(format!(".openwork/inputs/{id}"));
+    }
+    Ok(paths)
+}
+
+fn safe_workspace_input_directory(workspace: &FsPath) -> Result<PathBuf, ApiError> {
+    let openwork = workspace.join(".openwork");
+    reject_symlink_if_present(&openwork)?;
+    fs::create_dir_all(&openwork).map_err(|_| ApiError::internal())?;
+    let inputs = openwork.join("inputs");
+    reject_symlink_if_present(&inputs)?;
+    fs::create_dir_all(&inputs).map_err(|_| ApiError::internal())?;
+    let canonical = fs::canonicalize(inputs).map_err(|_| ApiError::internal())?;
+    if !canonical.starts_with(workspace) {
+        return Err(ApiError::invalid("invalid_workspace_id"));
+    }
+    Ok(canonical)
+}
+
+fn reject_symlink_if_present(path: &FsPath) -> Result<(), ApiError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(ApiError::invalid("invalid_workspace_id"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ApiError::internal()),
+    }
 }
 
 fn resolve_workspace(root: &FsPath, workspace: &str) -> Result<PathBuf, ApiError> {
@@ -1034,6 +1673,258 @@ fn decide_approval(
         )
         .map(Json)
         .map_err(|_| ApiError::conflict("approval_decision_rejected"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecuteApprovalRequest {
+    expected_revision: i64,
+}
+
+#[derive(FromRow)]
+struct CapabilityActionRow {
+    action_id: Uuid,
+    run_id: Uuid,
+    app_id: String,
+    capability_id: String,
+    resource: String,
+    parameters: Value,
+    parameter_hash: String,
+}
+
+struct PreparedCapabilityExecution {
+    row: CapabilityActionRow,
+    claimed: ClaimedAction,
+    action_id: ActionId,
+    run_id: RunId,
+    actor: ActorId,
+}
+
+async fn execute_approved_capability(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<AuthActor>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ExecuteApprovalRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let expected_revision = u64::try_from(request.expected_revision)
+        .map_err(|_| ApiError::invalid("invalid_revision"))?;
+    let prepared = prepare_capability_execution(&state, id, expected_revision, actor.0).await?;
+    reserve_capability_execution(&state.pool, &prepared.row).await?;
+    let connectors = Arc::clone(&state.connectors);
+    let action_uuid = prepared.row.action_id;
+    let run_id = prepared.run_id.clone();
+    let trusted_actor = prepared.actor.clone();
+    let Ok(Ok(output)) = tokio::task::spawn_blocking(move || {
+        connector_runtime::execute_claimed_github_capability(&connectors, prepared.claimed)
+    })
+    .await
+    else {
+        mark_capability_execution_uncertain(&state.pool, action_uuid).await;
+        fail_capability_run(&state.store, &run_id, &trusted_actor);
+        return Err(ApiError::unavailable("connector_execution_uncertain"));
+    };
+    finalize_capability_execution(
+        &state,
+        action_uuid,
+        prepared.action_id,
+        run_id,
+        trusted_actor,
+        output,
+    )
+    .await
+}
+
+async fn prepare_capability_execution(
+    state: &AppState,
+    approval_uuid: Uuid,
+    expected_revision: u64,
+    actor: String,
+) -> Result<PreparedCapabilityExecution, ApiError> {
+    let approval_id = parse_approval_id(approval_uuid)?;
+    let row = sqlx::query_as::<_, CapabilityActionRow>(
+        "SELECT action_id,run_id,app_id,capability_id,resource,parameters,parameter_hash::text FROM capability_actions WHERE approval_id=$1",
+    )
+    .bind(approval_uuid)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("capability_action_not_found"))?;
+    if row.capability_id != "github.issue.create" {
+        return Err(ApiError::conflict("capability_action_not_executable"));
+    }
+    let enabled = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .get(&row.app_id)
+        .is_some_and(|app| app.enabled);
+    if !enabled {
+        return Err(ApiError::conflict("app_not_enabled"));
+    }
+    validate_github_issue_create(&row.parameters)?;
+    let action_id =
+        ActionId::parse(&row.action_id.to_string()).map_err(|_| ApiError::internal())?;
+    let run_id = RunId::parse(&row.run_id.to_string()).map_err(|_| ApiError::internal())?;
+    let action = ActionRequest::new(
+        action_id.clone(),
+        run_id.clone(),
+        row.capability_id.clone(),
+        row.resource.clone(),
+        row.parameters.clone(),
+    )
+    .map_err(|_| ApiError::internal())?;
+    if action.parameter_hash().as_str() != row.parameter_hash {
+        return Err(ApiError::conflict("capability_action_binding_mismatch"));
+    }
+    let approval = state
+        .store
+        .get_approval(&approval_id)
+        .map_err(|_| ApiError::internal())?
+        .ok_or(ApiError::not_found("approval_not_found"))?;
+    if approval.revision != expected_revision {
+        return Err(ApiError::conflict("approval_execution_rejected"));
+    }
+    let trusted_actor = ActorId::parse(actor).map_err(|_| ApiError::internal())?;
+    let claim = match approval.status {
+        ApprovalStatus::Approved => {
+            state
+                .store
+                .consume_approval(
+                    &approval_id,
+                    expected_revision,
+                    &action,
+                    trusted_actor.clone(),
+                    UtcTimestamp::now(),
+                )
+                .map_err(|_| ApiError::conflict("approval_execution_rejected"))?
+                .action_claim
+        }
+        ApprovalStatus::Consumed => state
+            .store
+            .get_action_claim(&action_id)
+            .map_err(|_| ApiError::internal())?
+            .ok_or(ApiError::conflict("approval_execution_rejected"))?,
+        _ => return Err(ApiError::conflict("approval_execution_rejected")),
+    };
+    let claimed = ClaimedAction::verify(&state.store, action, claim)
+        .map_err(|_| ApiError::conflict("approval_execution_rejected"))?;
+    Ok(PreparedCapabilityExecution {
+        row,
+        claimed,
+        action_id,
+        run_id,
+        actor: trusted_actor,
+    })
+}
+
+async fn reserve_capability_execution(
+    pool: &PgPool,
+    row: &CapabilityActionRow,
+) -> Result<(), ApiError> {
+    let reservation = sqlx::query(
+        "INSERT INTO capability_action_executions(action_id,parameter_hash,state,started_at) VALUES($1,$2,'started',$3) ON CONFLICT DO NOTHING",
+    )
+    .bind(row.action_id)
+    .bind(row.parameter_hash.clone())
+    .bind(OffsetDateTime::now_utc())
+    .execute(pool)
+    .await?;
+    if reservation.rows_affected() != 1 {
+        return Err(ApiError::conflict("capability_action_already_executed"));
+    }
+    Ok(())
+}
+
+async fn finalize_capability_execution(
+    state: &AppState,
+    action_uuid: Uuid,
+    action_id: ActionId,
+    run_id: RunId,
+    actor: ActorId,
+    output: Value,
+) -> Result<Json<Value>, ApiError> {
+    let encoded = serde_json::to_vec(&output).map_err(|_| ApiError::internal())?;
+    let result_digest = hex_digest(Sha256::digest(encoded).into());
+    let performed = sqlx::query(
+        "UPDATE capability_action_executions SET state='performed',completed_at=$2,result_sha256=$3 WHERE action_id=$1 AND state='started'",
+    )
+    .bind(action_uuid)
+    .bind(OffsetDateTime::now_utc())
+    .bind(result_digest)
+    .execute(&state.pool)
+    .await?;
+    if performed.rows_affected() != 1 {
+        fail_capability_run(&state.store, &run_id, &actor);
+        return Err(ApiError::internal());
+    }
+    let receipt = ActionExecutionReceipt {
+        run_id: run_id.clone(),
+        action_id: action_id.clone(),
+        parameter_hash: action_parameter_hash_from_store(&state.store, &action_id)?,
+    };
+    if !state
+        .store
+        .reconcile_action_execution(
+            &receipt,
+            AuditAppend::new(actor.clone(), UtcTimestamp::now()),
+        )
+        .map_err(|_| ApiError::internal())?
+    {
+        return Err(ApiError::conflict("capability_action_already_reconciled"));
+    }
+    let running = state
+        .store
+        .get_run(&run_id)
+        .map_err(|_| ApiError::internal())?
+        .ok_or(ApiError::not_found("run_not_found"))?;
+    let completed = state
+        .store
+        .transition_run(
+            &run_id,
+            running.revision,
+            RunStatus::Succeeded,
+            None,
+            AuditAppend::new(actor, UtcTimestamp::now()),
+        )
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(json!({
+        "status":"completed",
+        "run_id":completed.id,
+        "action_id":action_id,
+        "output":output
+    })))
+}
+
+fn action_parameter_hash_from_store(
+    store: &PostgresExecutionStore,
+    action_id: &ActionId,
+) -> Result<Sha256Digest, ApiError> {
+    store
+        .get_action_claim(action_id)
+        .map_err(|_| ApiError::internal())?
+        .map(|claim| claim.parameter_hash)
+        .ok_or(ApiError::conflict("approval_execution_rejected"))
+}
+
+async fn mark_capability_execution_uncertain(pool: &PgPool, action_id: Uuid) {
+    let _ = sqlx::query(
+        "UPDATE capability_action_executions SET state='uncertain',completed_at=$2 WHERE action_id=$1 AND state='started'",
+    )
+    .bind(action_id)
+    .bind(OffsetDateTime::now_utc())
+    .execute(pool)
+    .await;
+}
+
+fn fail_capability_run(store: &PostgresExecutionStore, run_id: &RunId, actor: &ActorId) {
+    if let Ok(Some(run)) = store.get_run(run_id) {
+        let _ = store.transition_run(
+            run_id,
+            run.revision,
+            RunStatus::Failed,
+            Some("external capability execution uncertain"),
+            AuditAppend::new(actor.clone(), UtcTimestamp::now()),
+        );
+    }
 }
 
 fn parse_approval_id(id: Uuid) -> Result<ApprovalId, ApiError> {
@@ -1411,6 +2302,20 @@ mod tests {
                 .expect("router response");
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
+    }
+
+    #[tokio::test]
+    async fn app_routes_require_authentication_and_unknown_apps_fail_closed() {
+        let unauthenticated = test_router(PathBuf::from("."))
+            .oneshot(request(Method::GET, "/v1/apps", "", false))
+            .await
+            .expect("router response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let unknown = test_router(PathBuf::from("."))
+            .oneshot(request(Method::POST, "/v1/apps/not-real/install", "", true))
+            .await
+            .expect("router response");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

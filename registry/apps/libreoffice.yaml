@@ -1,0 +1,38 @@
+apiVersion: openwork.io/v1
+kind: CapabilityPack
+metadata:
+  id: org.openwork.libreoffice
+  name: LibreOffice
+  version: 1.0.0
+  description: Analyze office files and create documents, spreadsheets, presentations, and PDFs.
+provider:
+  type: cli
+  adapter: cli-anything
+capabilities:
+  - id: libreoffice.spreadsheet.read
+    description: Import and inspect one spreadsheet from the workspace.
+    risk: L0
+  - id: libreoffice.spreadsheet.create
+    description: Create a spreadsheet artifact.
+    risk: L1
+  - id: libreoffice.spreadsheet.write
+    description: Write cells and sheets in an artifact project.
+    risk: L1
+  - id: libreoffice.document.create
+    description: Create a document artifact.
+    risk: L1
+  - id: libreoffice.presentation.create
+    description: Create a presentation artifact.
+    risk: L1
+  - id: libreoffice.office_bundle.create
+    description: Create an exact-bound spreadsheet and presentation artifact bundle.
+    risk: L1
+  - id: libreoffice.pdf.export
+    description: Export an artifact project as PDF.
+    risk: L1
+permissions:
+  filesystem:
+    read: [workspace]
+    write: [artifacts]
+  network: none
+  credentials: []

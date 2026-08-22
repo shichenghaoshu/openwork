@@ -8,12 +8,11 @@ business tools, and safe execution.
 [中文](README.zh-CN.md) · [Getting started](docs/getting-started.md) ·
 [Deploy for a client](docs/deploy-for-client.md) · [Build a pack](docs/packs/build-your-first-pack.md)
 
-> Status: the M1 completion work is under integration. A real-container sales
-> demo, Postgres control state, policy/approval/action controls, artifacts,
-> hash-chain audit, durable worker loop, and one-time prompt handoff are
-> implemented. Employee Workspace and read-only GitHub/Feishu MCP discovery are
-> now included; governed MCP tool execution remains disabled. See the evidence-scoped
-> [current state](CURRENT_STATE.md).
+> Status: the App Platform integration adds OpenCode and Pi worker adapters,
+> Runtime Auto routing, reviewed Capability Packs, governed GitHub MCP calls,
+> a sandboxed CLI-Anything/LibreOffice App, Files, and administrator App/Runtime
+> views to Employee Workspace. See the evidence-scoped [current state](CURRENT_STATE.md)
+> and [App Platform runbook](docs/app-platform.md).
 
 ## What employees will be able to do
 
@@ -60,4 +59,5 @@ See the [platform evidence matrix](docs/platform-support.md) for the difference
 between fixtures, CI smoke tests, and real-host validation.
 
 The desktop [Employee Workspace](apps/admin-web/README.md) provides tasks,
-approvals, and cached connector discovery through the authenticated Control API.
+uploaded task inputs, artifacts, apps, approvals, and runtime administration
+through the authenticated Control API.

@@ -6,7 +6,8 @@ use openwork_execution::{
 use openwork_runtime::task::{
     CLAUDE_CLI_REFERENCE_URL, CLAUDE_HEADLESS_URL, CODEX_CLI_REFERENCE_URL,
     CODEX_NON_INTERACTIVE_URL, ClaudeTaskAdapter, CodexTaskAdapter, MAX_PROVIDER_LINE_BYTES,
-    MAX_RUNTIME_PROMPT_BYTES, PROVIDER_DOCS_ACCESSED_ON, PROVIDER_VERSION_GATE_POLICY,
+    MAX_RUNTIME_PROMPT_BYTES, OPENCODE_CLI_REFERENCE_URL, OpenCodeTaskAdapter,
+    PI_RPC_REFERENCE_URL, PROVIDER_DOCS_ACCESSED_ON, PROVIDER_VERSION_GATE_POLICY, PiTaskAdapter,
     RuntimeEventDecoder, RuntimeTaskAdapter, decode_sandbox_result,
 };
 use serde_json::json;
@@ -174,6 +175,73 @@ fn codex_preparation_sets_explicit_defense_in_depth_flags() {
     assert!(!args.iter().any(|argument| {
         argument == "--yolo" || argument == "--dangerously-bypass-approvals-and-sandbox"
     }));
+}
+
+#[test]
+fn opencode_preparation_uses_piped_prompt_and_machine_json() {
+    let prompt = "classify this; $(do-not-run)";
+    let invocation = OpenCodeTaskAdapter::new("/usr/local/bin/opencode")
+        .prepare(&task(
+            "opencode",
+            &["filesystem.read"],
+            prompt,
+            "/workspace",
+        ))
+        .expect("OpenCode invocation");
+    assert_eq!(invocation.command.program(), "/usr/local/bin/opencode");
+    assert_eq!(arguments(&invocation), ["run", "--format", "json"]);
+    assert_eq!(invocation.stdin, prompt.as_bytes());
+    assert!(!format!("{invocation:?}").contains(prompt));
+    assert!(
+        !arguments(&invocation)
+            .iter()
+            .any(|arg| arg.contains(prompt))
+    );
+}
+
+#[test]
+fn pi_preparation_uses_rpc_jsonl_over_stdin() {
+    let prompt = "inspect project; $(do-not-run)";
+    let invocation = PiTaskAdapter::new("/usr/local/bin/pi")
+        .prepare(&task("pi", &["filesystem.read"], prompt, "/workspace"))
+        .expect("Pi invocation");
+    assert_eq!(invocation.command.program(), "/usr/local/bin/pi");
+    assert_eq!(arguments(&invocation), ["--mode", "rpc", "--no-session"]);
+    let request: serde_json::Value = serde_json::from_slice(&invocation.stdin).expect("RPC JSON");
+    assert_eq!(request["type"], "prompt");
+    assert_eq!(request["message"], prompt);
+    assert!(!format!("{invocation:?}").contains(prompt));
+    assert!(
+        !arguments(&invocation)
+            .iter()
+            .any(|arg| arg.contains(prompt))
+    );
+}
+
+#[test]
+fn opencode_and_pi_decoders_accept_documented_machine_events() {
+    let run_id = RunId::generate();
+    let mut opencode = OpenCodeTaskAdapter::new("/opencode").decoder(run_id.clone());
+    let start = opencode
+        .decode_stdout_line(br#"{"type":"session.created","sessionID":"s"}"#)
+        .expect("OpenCode start");
+    assert!(matches!(start[0].payload, RuntimeEventPayload::Started));
+    let message = opencode
+        .decode_stdout_line(br#"{"type":"message.part.updated","properties":{"part":{"type":"text","text":"hello"}}}"#)
+        .expect("OpenCode message");
+    assert!(
+        matches!(&message[0].payload, RuntimeEventPayload::Message { content } if content == "hello")
+    );
+
+    let mut pi = PiTaskAdapter::new("/pi").decoder(run_id);
+    let session = pi
+        .decode_stdout_line(br#"{"type":"session","version":3}"#)
+        .expect("Pi session");
+    assert!(matches!(session[0].payload, RuntimeEventPayload::Started));
+    let delta = pi.decode_stdout_line(br#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#).expect("Pi delta");
+    assert!(
+        matches!(&delta[0].payload, RuntimeEventPayload::Message { content } if content == "hello")
+    );
 }
 
 #[test]
@@ -545,12 +613,14 @@ fn orchestrator_output_processor_shape_propagates_decoder_errors() {
 
 #[test]
 fn implementation_records_current_primary_sources() {
-    assert_eq!(PROVIDER_DOCS_ACCESSED_ON, "2026-08-10");
+    assert_eq!(PROVIDER_DOCS_ACCESSED_ON, "2026-08-23");
     for url in [
         CLAUDE_CLI_REFERENCE_URL,
         CLAUDE_HEADLESS_URL,
         CODEX_NON_INTERACTIVE_URL,
         CODEX_CLI_REFERENCE_URL,
+        OPENCODE_CLI_REFERENCE_URL,
+        PI_RPC_REFERENCE_URL,
     ] {
         assert!(url.starts_with("https://"));
     }

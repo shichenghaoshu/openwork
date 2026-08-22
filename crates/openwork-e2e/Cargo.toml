@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openwork-apps = { path = "../openwork-apps" }
 openwork-core = { path = "../openwork-core" }
 openwork-execution = { path = "../openwork-execution" }
 openwork-sandbox = { path = "../openwork-sandbox" }
