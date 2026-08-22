@@ -32,6 +32,10 @@ services:
       OPENWORK_API_ACTOR: ${OPENWORK_API_ACTOR:-control-admin}
       OPENWORK_CONTROL_BIND: 0.0.0.0:8080
       OPENWORK_WORKSPACE_ROOT: /workspaces
+      # This hardened control-plane container intentionally has no container
+      # engine socket. Run creation therefore fails closed until a separately
+      # configured host deployment enables the in-process worker.
+      OPENWORK_WORKER_ENABLED: "0"
     ports: ["127.0.0.1:${OPENWORK_CONTROL_PORT:-8080}:8080"]
     volumes:
       - type: bind

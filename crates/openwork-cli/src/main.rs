@@ -7,7 +7,7 @@ use openwork_config::{
 use openwork_core::{ErrorCode, OpenWorkError, PRODUCT_NAME};
 use openwork_doctor::{CheckStatus, DoctorReport, inspect_platform};
 use openwork_e2e::sales_demo::{SalesDemoConfig, SalesDemoReport, run_sales_demo};
-use openwork_execution::DigestPinnedImageRef;
+use openwork_execution::{DigestPinnedImageRef, Run};
 use openwork_installer::{
     ExecutionMode, InstallExecutionFailure, InstallExecutionReport, InstallExecutor, InstallPlan,
     StepResult, StepStatus, dry_run_plan, managed_runtime_plan,
@@ -22,7 +22,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -251,9 +251,9 @@ fn execute(cli: Cli, probe: &impl PlatformProbe) -> Result<u8, (OpenWorkError, b
             runtime,
             workspace,
             prompt,
-            wait: _wait,
+            wait,
             json,
-        } => execute_run(&runtime, &workspace, &prompt, json),
+        } => execute_run(&runtime, &workspace, &prompt, wait, json),
         Command::Demo { command } => execute_demo(command),
         Command::Runtime {
             command: RuntimeCommand::Info { id, json },
@@ -579,27 +579,117 @@ fn execute_run(
     runtime: &str,
     workspace: &str,
     prompt: &str,
+    wait: bool,
     json: bool,
 ) -> Result<u8, (OpenWorkError, bool)> {
+    let workspace_path = Path::new(workspace);
     if !matches!(runtime, "claude-code" | "codex")
         || prompt.is_empty()
-        || !Path::new(workspace).is_dir()
+        || workspace_path.is_absolute()
+        || !workspace_path.is_dir()
     {
         return Err((
             OpenWorkError::new(ErrorCode::InvalidArguments, "invalid run request"),
             json,
         ));
     }
-    Err((
-        OpenWorkError::new(
-            ErrorCode::SandboxUnavailable,
-            "no durable runtime worker is configured; no run was created",
-        )
-        .with_remediation(
-            "Configure the Control API and a sandbox worker, or run `openwork demo sales` to verify the local M1 execution path.",
-        ),
-        json,
-    ))
+    let workspace = workspace.strip_prefix("./").unwrap_or(workspace).to_owned();
+    let base = control_api_url().map_err(|error| (error, json))?;
+    let token = std::env::var("OPENWORK_API_TOKEN")
+        .ok()
+        .filter(|value| value.len() >= 32)
+        .ok_or_else(|| {
+            (
+                OpenWorkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "OPENWORK_API_TOKEN is required and must contain at least 32 bytes",
+                ),
+                json,
+            )
+        })?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| (control_error("Control API client could not start"), json))?;
+    let endpoint = base
+        .join("/v1/runs")
+        .map_err(|_| (control_error("Control API URL is invalid"), json))?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "runtime": runtime,
+            "workspace": workspace,
+            "prompt": prompt,
+        }))
+        .send()
+        .map_err(|_| (control_error("Control API is unavailable"), json))?;
+    if !response.status().is_success() {
+        return Err((
+            control_error("Control API rejected the run; no successful execution was claimed"),
+            json,
+        ));
+    }
+    let mut run = response
+        .json::<Run>()
+        .map_err(|_| (control_error("Control API returned an invalid run"), json))?;
+    if wait {
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        while !run.status.is_terminal() {
+            if Instant::now() >= deadline {
+                return Err((control_error("Timed out waiting for the run"), json));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            let endpoint = base
+                .join(&format!("/v1/runs/{}", run.id.to_hyphenated()))
+                .map_err(|_| (control_error("Control API URL is invalid"), json))?;
+            let response = client
+                .get(endpoint)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|_| (control_error("Control API is unavailable"), json))?;
+            if !response.status().is_success() {
+                return Err((control_error("Control API run lookup failed"), json));
+            }
+            run = response
+                .json::<Run>()
+                .map_err(|_| (control_error("Control API returned an invalid run"), json))?;
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&run).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else {
+        println!("{}\t{:?}", run.id.to_hyphenated(), run.status);
+    }
+    Ok(0)
+}
+
+fn control_api_url() -> Result<reqwest::Url, OpenWorkError> {
+    let raw = std::env::var("OPENWORK_CONTROL_URL").map_err(|_| {
+        control_error("OPENWORK_CONTROL_URL is required; no run was created")
+            .with_remediation("Start a configured Control API worker or run `openwork demo sales`.")
+    })?;
+    let url = reqwest::Url::parse(&raw).map_err(|_| control_error("Control API URL is invalid"))?;
+    let loopback_http =
+        url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "localhost"));
+    if (url.scheme() != "https" && !loopback_http)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(control_error(
+            "Control API URL must use HTTPS or loopback HTTP and contain no credentials",
+        ));
+    }
+    Ok(url)
+}
+
+fn control_error(message: &'static str) -> OpenWorkError {
+    OpenWorkError::new(ErrorCode::SandboxUnavailable, message)
 }
 
 fn execute_demo(command: DemoCommand) -> Result<u8, (OpenWorkError, bool)> {

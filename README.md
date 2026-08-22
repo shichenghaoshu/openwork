@@ -9,10 +9,10 @@ business tools, and safe execution.
 [Deploy for a client](docs/deploy-for-client.md) · [Build a pack](docs/packs/build-your-first-pack.md)
 
 > Status: the M1 completion work is under integration. A real-container sales
-> demo, Postgres control state, policy/approval/action controls, artifacts, and
-> hash-chain audit are implemented. Durable worker leases and fail-closed
-> cancellation intent are implemented; the generic worker execution loop and
-> secure prompt delivery are still missing. See the evidence-scoped
+> demo, Postgres control state, policy/approval/action controls, artifacts,
+> hash-chain audit, durable worker loop, and one-time prompt handoff are
+> implemented. Employee Workspace and read-only GitHub/Feishu MCP discovery are
+> now included; governed MCP tool execution remains disabled. See the evidence-scoped
 > [current state](CURRENT_STATE.md).
 
 ## What employees will be able to do
@@ -58,3 +58,6 @@ published bootstrap alpha until the M1 integration is merged and released.
 
 See the [platform evidence matrix](docs/platform-support.md) for the difference
 between fixtures, CI smoke tests, and real-host validation.
+
+The desktop [Employee Workspace](apps/admin-web/README.md) provides tasks,
+approvals, and cached connector discovery through the authenticated Control API.

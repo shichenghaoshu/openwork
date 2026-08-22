@@ -10,6 +10,9 @@ rust-version.workspace = true
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 openwork-core = { path = "../openwork-core" }
 openwork-execution = { path = "../openwork-execution", features = ["postgres"] }
+openwork-runtime = { path = "../openwork-runtime" }
+openwork-sandbox = { path = "../openwork-sandbox" }
+openwork-worker = { path = "../openwork-worker" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -20,6 +23,7 @@ tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread", "
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower = { version = "=0.5.3", features = ["util"] }
 
 [lints]

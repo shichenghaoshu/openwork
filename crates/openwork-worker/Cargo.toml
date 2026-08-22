@@ -1,0 +1,20 @@
+[package]
+name = "openwork-worker"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/shichenghaoshu/openwork"
+rust-version = "1.95"
+
+[dependencies]
+openwork-core = { path = "../openwork-core" }
+openwork-execution = { path = "../openwork-execution" }
+openwork-runtime = { path = "../openwork-runtime" }
+serde_json.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

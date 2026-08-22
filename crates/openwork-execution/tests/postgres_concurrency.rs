@@ -9,8 +9,9 @@ use openwork_execution::store::{
 };
 use openwork_execution::{
     ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    ApprovalStatus, AuditEventType, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus,
-    SandboxCleanupStatus, SandboxResult, SandboxTermination, UtcTimestamp, sha256_bytes,
+    ApprovalStatus, Artifact, ArtifactId, ArtifactSizeBytes, AuditEventType,
+    EXECUTION_SCHEMA_VERSION, RelativeArtifactPath, Run, RunId, RunStatus, SandboxCleanupStatus,
+    SandboxResult, SandboxTermination, UtcTimestamp, sha256_bytes,
 };
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -241,6 +242,90 @@ fn postgres_leased_updates_require_current_capability_and_cancel_blocks_success(
                 Duration::seconds(30),
             )
             .is_err()
+    );
+}
+
+#[test]
+fn postgres_leased_worker_writes_require_capability_and_are_atomic() {
+    let _database_guard = database_test_guard();
+    let Some(store) = postgres_store() else {
+        return;
+    };
+    let run = create_run_in_status(&store, RunStatus::Queued);
+    let lease = store
+        .claim_next_run(
+            ActorId::parse("worker:postgres-leased").expect("worker"),
+            timestamp("2026-08-21T03:45:01Z"),
+            Duration::seconds(30),
+        )
+        .expect("claim")
+        .expect("lease");
+    let now = timestamp("2026-08-21T03:45:02Z");
+    assert!(
+        store
+            .append_audit(
+                &run.id,
+                AuditEventType::RuntimeOutput,
+                AuditAppend::new(actor(), now),
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .record_artifacts(
+                &run.id,
+                vec![artifact(&run.id, "report.txt")],
+                AuditAppend::new(actor(), now),
+            )
+            .is_err()
+    );
+    let receipt = ActionExecutionReceipt {
+        run_id: run.id.clone(),
+        action_id: ActionId::parse("01890f3e-a5f1-7cc2-98c0-5f9c6f5e7a13").expect("id"),
+        parameter_hash: sha256_bytes(b"parameters"),
+    };
+    assert!(
+        store
+            .reconcile_action_execution(&receipt, AuditAppend::new(actor(), now))
+            .is_err()
+    );
+    let runtime_event = store
+        .append_leased_runtime_audit(
+            &lease,
+            lease.run.revision,
+            AuditEventType::SandboxCreated,
+            now,
+        )
+        .expect("bound sandbox audit");
+    assert_eq!(runtime_event.actor, lease.owner);
+    assert!(
+        store
+            .record_leased_artifacts(
+                &lease,
+                lease.run.revision,
+                vec![artifact(&run.id, "same.txt"), artifact(&run.id, "same.txt")],
+                timestamp("2026-08-21T03:45:03Z"),
+            )
+            .is_err()
+    );
+    assert!(store.artifacts(&run.id).expect("artifacts").is_empty());
+    store
+        .record_leased_artifacts(
+            &lease,
+            lease.run.revision,
+            vec![artifact(&run.id, "report.txt")],
+            timestamp("2026-08-21T03:45:03Z"),
+        )
+        .expect("bound artifact batch");
+    assert_eq!(store.artifacts(&run.id).expect("artifacts").len(), 1);
+    assert_eq!(
+        store
+            .audit_events(&run.id)
+            .expect("audit")
+            .last()
+            .expect("artifact audit")
+            .actor,
+        lease.owner
     );
 }
 
@@ -851,6 +936,19 @@ fn create_run_in_status(store: &PostgresExecutionStore, target: RunStatus) -> Ru
 
 fn actor() -> ActorId {
     ActorId::parse("service:postgres-test").expect("actor")
+}
+
+fn artifact(run_id: &RunId, path: &str) -> Artifact {
+    Artifact {
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        id: ArtifactId::generate(),
+        run_id: run_id.clone(),
+        path: RelativeArtifactPath::parse(path).expect("path"),
+        media_type: "text/plain".to_owned(),
+        size_bytes: ArtifactSizeBytes::new(4).expect("size"),
+        sha256: sha256_bytes(b"data"),
+        created_at: timestamp("2026-08-21T03:45:03Z"),
+    }
 }
 
 fn timestamp(value: &str) -> UtcTimestamp {

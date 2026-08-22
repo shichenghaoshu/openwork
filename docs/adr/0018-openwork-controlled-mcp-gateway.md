@@ -1,6 +1,6 @@
 # OpenWork-controlled MCP gateway boundary
 
-Status: Accepted for v0.2 design; implementation deferred until M1 is complete
+Status: Accepted; read-only discovery implemented, governed execution pending
 
 ## Context
 
@@ -36,8 +36,17 @@ credentials after authorization; agent runtimes never receive the underlying
 credential. Transport and connector adapters may be replaced without changing
 policy or approval semantics.
 
-No MCP runtime, marketplace, credential store, or connector is implemented as
-part of M1. This ADR defines the boundary only and cannot block the sales demo.
+The first implementation milestone is deliberately narrower than tool
+execution. The Control API owns stdio MCP processes, forwards credentials only
+in their environment, performs `initialize` and `tools/list`, and returns a
+redacted catalog containing schema digests. GitHub and Feishu/Lark definitions
+are pinned and configured read-only. Successful discovery is cached for 60
+seconds and failures for 15 seconds.
+
+No MCP `tools/call` route is exposed yet. Tool execution remains blocked until
+the request can consume an exact `ActionClaim` and produce the policy, approval,
+credential, result-redaction, and audit evidence required above. Agent runtimes
+therefore still cannot access MCP credentials or invoke providers directly.
 
 ## Consequences
 
@@ -62,10 +71,12 @@ tool responses are excluded from logs and audit events.
 
 ## License implications
 
-Each future connector requires its own upstream, license, and distribution
-review. This ADR adds no dependency.
+Each connector requires its own upstream, license, and distribution review.
+The first definitions invoke the official MIT-licensed GitHub MCP Server and
+Feishu/Lark OpenAPI MCP packages out of process; neither is linked into an
+OpenWork binary.
 
 ## Revisit trigger
 
-Revisit after M1 is repeatably verified and before the first production MCP
-connector or credential broker is implemented.
+Revisit before exposing the first MCP `tools/call` route or adding a durable
+credential broker.

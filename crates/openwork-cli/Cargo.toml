@@ -22,6 +22,7 @@ openwork-execution = { path = "../openwork-execution" }
 openwork-e2e = { path = "../openwork-e2e" }
 openwork-policy = { path = "../openwork-policy" }
 openwork-sandbox = { path = "../openwork-sandbox" }
+reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 
