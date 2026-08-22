@@ -614,10 +614,18 @@ fn call_exchange(
     if serde_json::to_vec(&output).map_or(true, |encoded| encoded.len() > MAX_CALL_RESULT_BYTES) {
         return Err(McpError::OutputLimit);
     }
+    validated_call_result(&output)
+}
+
+fn validated_call_result(output: &Value) -> Result<Value, McpError> {
     if output.get("error").is_some() {
         return Err(McpError::Protocol);
     }
-    output.get("result").cloned().ok_or(McpError::Protocol)
+    let result = output.get("result").cloned().ok_or(McpError::Protocol)?;
+    match result.get("isError") {
+        Some(Value::Bool(false)) | None => Ok(result),
+        Some(_) => Err(McpError::Protocol),
+    }
 }
 
 fn send_json(stdin: &mut impl Write, value: &Value) -> Result<(), McpError> {
@@ -735,6 +743,12 @@ mod tests {
         );
         assert!(github_mapping("github.tools.call").is_none());
         assert!(github_mapping("delete_repository").is_none());
+    }
+
+    #[test]
+    fn mcp_tool_error_result_is_never_reported_as_success() {
+        assert!(validated_call_result(&json!({"result":{"isError":true,"content":[]}})).is_err());
+        assert!(validated_call_result(&json!({"result":{"isError":false,"content":[]}})).is_ok());
     }
 
     #[test]

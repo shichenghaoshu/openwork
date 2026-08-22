@@ -25,6 +25,7 @@ use openwork_runtime::{
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -430,6 +431,7 @@ fn execute_app_install(
             json,
         )
     })?;
+    let remote_install = install_app_in_control_api(id.as_str()).map_err(|error| (error, json))?;
     let path = local_app_state_path(host);
     let mut state = read_local_app_state(&path).map_err(|error| (error, json))?;
     state.schema_version = 1;
@@ -449,7 +451,7 @@ fn execute_app_install(
                 "app_id": id,
                 "enabled": true,
                 "state_path": path,
-                "remote_install": false,
+                "remote_install": remote_install,
             }))
             .unwrap_or_default()
         );
@@ -459,9 +461,60 @@ fn execute_app_install(
             app.metadata.name
         );
         println!("State: {}", path.display());
-        println!("No remote installation or credentials were performed.");
+        if remote_install {
+            println!(
+                "The running Control API enabled this App; credentials remain server-managed."
+            );
+        } else {
+            println!("No Control API was configured; only local reviewed state was recorded.");
+        }
     }
     Ok(0)
+}
+
+fn install_app_in_control_api(app_id: &str) -> Result<bool, OpenWorkError> {
+    let base_url = env::var("OPENWORK_CONTROL_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let token = env::var("OPENWORK_CONTROL_API_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let (base_url, token) = match (base_url, token) {
+        (Some(base_url), Some(token)) => (base_url, token),
+        (None, None) => return Ok(false),
+        _ => {
+            return Err(OpenWorkError::new(
+                ErrorCode::ConfigInvalid,
+                "both Control API URL and token are required for remote App installation",
+            ));
+        }
+    };
+    let endpoint = format!(
+        "{}/v1/apps/{app_id}/install",
+        base_url.trim_end_matches('/')
+    );
+    let url = reqwest::Url::parse(&endpoint)
+        .map_err(|_| OpenWorkError::new(ErrorCode::ConfigInvalid, "Control API URL is invalid"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(OpenWorkError::new(
+            ErrorCode::ConfigInvalid,
+            "Control API URL must use HTTP or HTTPS",
+        ));
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| client.post(url).bearer_auth(token).send())
+        .map_err(|_| {
+            OpenWorkError::new(ErrorCode::Io, "Control API App installation request failed")
+        })?;
+    if !response.status().is_success() {
+        return Err(OpenWorkError::new(
+            ErrorCode::ConfigInvalid,
+            "Control API rejected App installation",
+        ));
+    }
+    Ok(true)
 }
 
 fn execute_app_import(

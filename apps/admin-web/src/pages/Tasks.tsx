@@ -19,7 +19,13 @@ export default function Tasks(): React.JSX.Element {
     try { const next = await api.getRun(id); setRun(next); if (terminal.has(next.status) && timer.current) window.clearInterval(timer.current) }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)) }
   }
-  useEffect(() => { void api.listFiles().then(setFiles).catch(() => undefined); return () => { if (timer.current) window.clearInterval(timer.current) } }, [])
+  useEffect(() => {
+    void api.listFiles().then(setFiles).catch(() => undefined)
+    void api.getSettings().then((settings) => {
+      if (typeof settings.default_runtime === 'string' && runtimes.some(([id]) => id === settings.default_runtime)) setRuntime(settings.default_runtime)
+    }).catch(() => undefined)
+    return () => { if (timer.current) window.clearInterval(timer.current) }
+  }, [])
   const create = async (): Promise<void> => {
     setBusy(true); setError(null)
     try { const created = await api.createRun({ runtime, workspace: workspace.trim(), prompt: prompt.trim(), file_ids: fileIds }); setRun(created); if (timer.current) window.clearInterval(timer.current); timer.current = window.setInterval(() => void poll(created.id), 2500) }

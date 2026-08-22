@@ -1685,6 +1685,7 @@ struct ExecuteApprovalRequest {
 struct CapabilityActionRow {
     action_id: Uuid,
     run_id: Uuid,
+    app_id: String,
     capability_id: String,
     resource: String,
     parameters: Value,
@@ -1741,7 +1742,7 @@ async fn prepare_capability_execution(
 ) -> Result<PreparedCapabilityExecution, ApiError> {
     let approval_id = parse_approval_id(approval_uuid)?;
     let row = sqlx::query_as::<_, CapabilityActionRow>(
-        "SELECT action_id,run_id,capability_id,resource,parameters,parameter_hash::text FROM capability_actions WHERE approval_id=$1",
+        "SELECT action_id,run_id,app_id,capability_id,resource,parameters,parameter_hash::text FROM capability_actions WHERE approval_id=$1",
     )
     .bind(approval_uuid)
     .fetch_optional(&state.pool)
@@ -1749,6 +1750,15 @@ async fn prepare_capability_execution(
     .ok_or(ApiError::not_found("capability_action_not_found"))?;
     if row.capability_id != "github.issue.create" {
         return Err(ApiError::conflict("capability_action_not_executable"));
+    }
+    let enabled = state
+        .installed_apps
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .get(&row.app_id)
+        .is_some_and(|app| app.enabled);
+    if !enabled {
+        return Err(ApiError::conflict("app_not_enabled"));
     }
     validate_github_issue_create(&row.parameters)?;
     let action_id =
