@@ -8,10 +8,11 @@
 [English](README.md) · [快速开始](docs/getting-started.md) ·
 [为客户部署](docs/deploy-for-client.md) · [开发 Capability Pack](docs/packs/build-your-first-pack.md)
 
-> 当前状态：M1 完成工作正在集成。真实容器销售演示、Postgres 控制状态、
-> 策略/审批/动作控制、产物与哈希链审计已实现；持久化 worker 租约与 fail-closed
-> 取消意图已实现，通用 worker 执行循环及安全 prompt 交付仍缺失。证据分级见
-> [当前状态](CURRENT_STATE.md)。
+> 当前状态：App Platform 集成已加入 OpenCode/Pi Runtime、Auto 路由、
+> Capability Pack、受控 GitHub MCP 调用、沙箱化 CLI-Anything/LibreOffice App，
+> 以及 Employee Workspace 的 Files/Apps/Runtime 管理界面。已实跑和仍属
+> fixture 的边界见[当前状态](CURRENT_STATE.md)，运行配置见
+> [App Platform runbook](docs/app-platform.md)。
 
 ## 员工未来可以完成
 

@@ -1,8 +1,9 @@
 # Employee Workspace
 
 Employee Workspace is the OpenWork desktop interface for the authenticated
-Control API. It provides four operational views: Workspace, Tasks, Approvals,
-and Connectors.
+Control API. It provides employee views for Workspace, Tasks, Files, Apps, and
+Approvals, plus administrator-only views for AI Runtimes, the App Store, and
+Settings.
 
 ## Security boundary
 
@@ -11,7 +12,9 @@ process reads both from its environment and exposes only a fixed IPC allowlist:
 
 - task creation, status polling, and cancellation;
 - approval listing and approve/deny decisions;
-- connector and connector-tool reads;
+- file listing, upload, and metadata reads;
+- employee app listing and administrator app management;
+- administrator runtime and settings reads;
 - unauthenticated health checks.
 
 There is no CLI bridge, shell execution, filesystem access, or arbitrary HTTP
@@ -23,11 +26,11 @@ OPENWORK_CONTROL_API_BASE_URL=http://127.0.0.1:8080
 OPENWORK_CONTROL_API_TOKEN=replace-with-the-control-api-token
 ```
 
-The connector screens call `/v1/connectors` and `/v1/connectors/:id/tools`.
-The Control API caches successful MCP tool discovery for 60 seconds and failed
-probes for 15 seconds, so refreshing the interface does not repeatedly call an
-upstream service. Connector execution and credentials stay in the Control API
-process; the renderer receives only redacted tool metadata.
+The desktop bridge uses a fixed route allowlist. In addition to task and
+approval routes, it calls `/v1/files`, `/v1/apps`, and the corresponding
+`/v1/admin/*` routes. A server that has not implemented one of those routes
+returns its real error to the employee; the desktop app does not substitute
+sample data.
 
 An enabled runtime worker also requires `OPENWORK_PROVIDER_NETWORK`. This must
 name a separately provisioned container network whose egress policy permits
