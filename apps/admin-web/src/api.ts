@@ -1,5 +1,6 @@
 import type { OpenworkApi, BridgeResponse } from '../electron/preload'
-import type { Approval, Connector, ConnectorTool, Run, RuntimeInfo, WorkspaceApp, WorkspaceFile } from './types'
+import { getLocale } from './i18n'
+import type { Approval, AuditEventRow, CapabilityDescriptor, Connector, ConnectorTool, InvokeResult, Run, RuntimeInfo, SalesDemoReport, WorkspaceApp, WorkspaceFile } from './types'
 
 declare global {
   interface Window { openwork: OpenworkApi }
@@ -12,7 +13,7 @@ function unwrap<T>(response: BridgeResponse): T {
 
 interface FileWire { id: string; name: string; bytes: number; sha256: string }
 interface AppWire {
-  app: { metadata: { id: string; name: string; description: string }; capabilities?: unknown[] }
+  app: { metadata: { id: string; name: string; description: string }; capabilities?: CapabilityDescriptor[] }
   installed: boolean
   enabled: boolean
 }
@@ -36,14 +37,14 @@ function normalizeApp(item: AppWire): WorkspaceApp {
 }
 
 function normalizeRuntime(item: RuntimeWire): RuntimeInfo {
-  return { id: item.id, name: item.id, status: item.worker_ready ? 'Ready' : item.configured ? 'Configured' : 'Not configured' }
+  return { id: item.id, name: item.id, status: item.worker_ready ? 'ready' : item.configured ? 'configured' : 'not_configured' }
 }
 
 function appNameFromCapability(value: unknown): string | null {
   if (typeof value !== 'string') return null
   if (value.startsWith('github.')) return 'GitHub'
   if (value.startsWith('libreoffice.')) return 'LibreOffice'
-  if (value.startsWith('feishu.')) return 'Feishu'
+  if (value.startsWith('feishu.')) return getLocale() === 'zh' ? '飞书' : 'Feishu'
   return null
 }
 
@@ -68,6 +69,7 @@ async function getRunDetail(id: string): Promise<Run> {
     artifacts: artifactItems.map((item) => ({ ...item, name: item.path.split('/').pop() || item.path })),
     actions,
     approvals: approvalItems.map((item) => ({ id: item.id, status: item.status })),
+    events: eventItems.map((item: AuditEventRow) => item),
   }
 }
 
@@ -91,4 +93,9 @@ export const api = {
   getSettings: async (): Promise<Record<string, unknown>> => unwrap(await window.openwork.getSettings()),
   updateSettings: async (default_runtime: string): Promise<Record<string, unknown>> =>
     unwrap(await window.openwork.updateSettings({ default_runtime })),
+  invokeCapability: async (appId: string, capability: string, body: { resource: string; parameters: unknown }): Promise<InvokeResult> =>
+    unwrap(await window.openwork.invokeCapability(appId, capability, body)),
+  executeApproval: async (id: string, expected_revision: number): Promise<Approval> =>
+    unwrap(await window.openwork.executeApproval(id, { expected_revision })),
+  runSalesDemo: async (): Promise<SalesDemoReport> => unwrap(await window.openwork.runSalesDemo()),
 }
