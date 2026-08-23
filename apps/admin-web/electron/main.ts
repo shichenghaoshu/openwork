@@ -52,9 +52,12 @@ async function controlRequest(
       data = undefined
     }
     if (response.ok) return { ok: true, status: response.status, data }
-    const message = typeof data === 'object' && data !== null && 'message' in data
-      ? String(data.message)
-      : text || `Control API request failed (${response.status})`
+    const errorValue = typeof data === 'object' && data !== null
+      ? ('message' in data ? String(data.message)
+        : 'error' in data ? String((data as { error: unknown }).error)
+        : null)
+      : null
+    const message = errorValue || text || `Control API request failed (${response.status})`
     return { ok: false, status: response.status, error: message }
   } catch (error) {
     return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) }
@@ -164,6 +167,17 @@ function registerIpc(): void {
   ipcMain.handle('control:updateSettings', (_event, body: { default_runtime: string }) =>
     controlRequest('POST', '/v1/admin/settings', body),
   )
+  ipcMain.handle('control:invokeCapability', (_event, appId: string, capability: string, body: { resource: string; parameters: unknown }) =>
+    encodeURIComponent(appId) === appId && appId.length > 0 && encodeURIComponent(capability) === capability && capability.length > 0
+      ? controlRequest('POST', `/v1/apps/${encodeURIComponent(appId)}/capabilities/${encodeURIComponent(capability)}/invoke`, body)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid app or capability ID.' }),
+  )
+  ipcMain.handle('control:executeApproval', (_event, id: string, body: { expected_revision: number }) =>
+    validId(id)
+      ? controlRequest('POST', `/v1/approvals/${id}/execute`, body)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid approval ID.' }),
+  )
+  ipcMain.handle('control:runSalesDemo', () => controlRequest('POST', '/v1/admin/demo-sales'))
 }
 
 app.whenReady().then(() => {

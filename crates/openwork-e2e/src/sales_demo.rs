@@ -10,6 +10,7 @@ use openwork_execution::{
     SandboxUser, Sha256Digest, UtcTimestamp,
 };
 use openwork_sandbox::{DockerSandbox, SystemDockerCli};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ pub struct SalesDemoConfig {
 }
 
 /// Non-sensitive artifact evidence returned by the demo runner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SalesArtifactReport {
     pub path: RelativeArtifactPath,
     pub media_type: String,
@@ -41,7 +42,7 @@ pub struct SalesArtifactReport {
 }
 
 /// Non-sensitive append-only audit evidence returned by the demo runner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SalesAuditReport {
     pub sequence: u64,
     pub event_type: AuditEventType,
@@ -49,7 +50,7 @@ pub struct SalesAuditReport {
 }
 
 /// Completed real-container run evidence. Raw input, prompt, stdout, and stderr are omitted.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SalesDemoReport {
     pub run_id: RunId,
     pub status: RunStatus,

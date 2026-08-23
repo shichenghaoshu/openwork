@@ -32,6 +32,11 @@ const api = {
   getSettings: (): Promise<BridgeResponse> => ipcRenderer.invoke('control:getSettings'),
   updateSettings: (body: { default_runtime: string }): Promise<BridgeResponse> =>
     ipcRenderer.invoke('control:updateSettings', body),
+  invokeCapability: (appId: string, capability: string, body: { resource: string; parameters: unknown }): Promise<BridgeResponse> =>
+    ipcRenderer.invoke('control:invokeCapability', appId, capability, body),
+  executeApproval: (id: string, body: { expected_revision: number }): Promise<BridgeResponse> =>
+    ipcRenderer.invoke('control:executeApproval', id, body),
+  runSalesDemo: (): Promise<BridgeResponse> => ipcRenderer.invoke('control:runSalesDemo'),
 }
 
 export type OpenworkApi = typeof api

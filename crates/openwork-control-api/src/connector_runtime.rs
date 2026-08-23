@@ -245,6 +245,21 @@ fn github_arguments(
         }
         arguments.insert("method".to_owned(), Value::String(method.to_owned()));
     }
+    if mapping.tool == "list_issues" {
+        // GitHub MCP v1.10 uses cursor pagination; the OpenWork schema exposes
+        // a plain page count for the first page only. A requested `page` beyond
+        // 1 rejects with an exact reason instead of silently dropping it.
+        if let Some(page) = arguments.get("page") {
+            let page = page.as_u64().unwrap_or(1);
+            if page != 1 {
+                return Err(CallError::InvalidParameters);
+            }
+            arguments.remove("page");
+        }
+        if let Some(limit) = arguments.remove("perPage") {
+            arguments.insert("limit".to_owned(), limit);
+        }
+    }
     Ok(Value::Object(arguments))
 }
 
@@ -353,12 +368,15 @@ fn github_from_env() -> Result<ConnectorDefinition, ConfigError> {
                 environment.insert("DOCKER_HOST".to_owned(), SecretValue(host));
             }
             let mut args = vec!["run".to_owned(), "-i".to_owned(), "--rm".to_owned()];
-            for key in environment
-                .keys()
-                .filter(|key| key.as_str() != "DOCKER_HOST")
-            {
-                args.push("-e".to_owned());
-                args.push(key.clone());
+            // Emit explicit NAME=value pairs: bare `-e NAME` depends on the
+            // docker CLI copying a value from its own environment, which is
+            // not portable across client versions and is silently dropped
+            // under an empty inherited environment.
+            for (key, value) in &environment {
+                if key.as_str() != "DOCKER_HOST" {
+                    args.push("-e".to_owned());
+                    args.push(format!("{key}={}", value.0));
+                }
             }
             args.push(GITHUB_IMAGE.to_owned());
             Ok(ProcessConfig {
@@ -471,12 +489,43 @@ fn spawn(config: &ProcessConfig) -> Result<Child, McpError> {
     command.spawn().map_err(|_| McpError::Spawn)
 }
 
+/// Retains the most recent worker stderr so a failed connector exchange can
+/// report the provider's own error instead of hiding it behind a generic 503.
+fn capture_stderr(child: &mut Child) -> Arc<Mutex<Vec<u8>>> {
+    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail_thread = Arc::clone(&tail);
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = std::io::Read::read(&mut reader, &mut buffer).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                let mut guard = tail_thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.len() > 8192 {
+                    let excess = guard.len() - 8192;
+                    guard.drain(..excess);
+                }
+                guard.extend_from_slice(&buffer[..count]);
+            }
+        });
+    }
+    tail
+}
+
+fn report_stderr(tail: &Arc<Mutex<Vec<u8>>>, context: &str) {
+    let guard = tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tail_text = String::from_utf8_lossy(&guard);
+    if !tail_text.trim().is_empty() {
+        eprintln!("openwork-mcp {context} provider stderr: {tail_text}");
+    }
+}
+
 fn exchange(child: &mut Child, timeout: Duration) -> Result<Vec<ConnectorTool>, McpError> {
     let stdout = child.stdout.take().ok_or(McpError::Io)?;
-    let stderr = child.stderr.take().ok_or(McpError::Io)?;
-    thread::spawn(move || {
-        let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
-    });
+    let stderr_tail = capture_stderr(child);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -525,7 +574,11 @@ fn exchange(child: &mut Child, timeout: Duration) -> Result<Vec<ConnectorTool>, 
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     )?;
     let response = receive_response(&receiver, 2, deadline)?;
-    parse_tools(&response)
+    let result = parse_tools(&response);
+    if result.is_err() {
+        report_stderr(&stderr_tail, "discovery");
+    }
+    result
 }
 
 fn call_tool(
@@ -555,10 +608,7 @@ fn call_exchange(
     require_read_only: bool,
 ) -> Result<Value, McpError> {
     let stdout = child.stdout.take().ok_or(McpError::Io)?;
-    let stderr = child.stderr.take().ok_or(McpError::Io)?;
-    thread::spawn(move || {
-        let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
-    });
+    let stderr_tail = capture_stderr(child);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -612,9 +662,14 @@ fn call_exchange(
     )?;
     let output = receive_response(&receiver, 3, deadline)?;
     if serde_json::to_vec(&output).map_or(true, |encoded| encoded.len() > MAX_CALL_RESULT_BYTES) {
+        report_stderr(&stderr_tail, "call");
         return Err(McpError::OutputLimit);
     }
-    validated_call_result(&output)
+    let valid = validated_call_result(&output);
+    if valid.is_err() {
+        report_stderr(&stderr_tail, "call");
+    }
+    valid
 }
 
 fn validated_call_result(output: &Value) -> Result<Value, McpError> {
