@@ -32,6 +32,7 @@ services:
       OPENWORK_API_ACTOR: ${OPENWORK_API_ACTOR:-control-admin}
       OPENWORK_CONTROL_BIND: 0.0.0.0:8080
       OPENWORK_WORKSPACE_ROOT: /workspaces
+      OPENWORK_APP_REGISTRY: /registry/apps
       # This hardened control-plane container intentionally has no container
       # engine socket. Run creation therefore fails closed until a separately
       # configured host deployment enables the in-process worker.
@@ -41,6 +42,13 @@ services:
       - type: bind
         source: ${OPENWORK_HOST_WORKSPACE_ROOT:?set OPENWORK_HOST_WORKSPACE_ROOT}
         target: /workspaces
+        # The workspace bind must stay writable: the Files API persists uploads
+        # under .openwork/uploads for later worker pickup.
+      # The control API image carries no app manifests; mount the host registry
+      # read-only so the API fails open with the reviewed catalog.
+      - type: bind
+        source: ${OPENWORK_HOST_REGISTRY:-../registry/apps}
+        target: /registry/apps
         read_only: true
     healthcheck:
       test: ["CMD", "/usr/local/bin/openwork-control-api", "--healthcheck"]
