@@ -6,13 +6,13 @@ use openwork_execution::artifact::ArtifactScanner;
 use openwork_execution::store::{CancellationEvidence, RunLease, RunQueueRepository};
 use openwork_execution::{
     ApprovedMountDirectory, Artifact, DigestPinnedImageRef, Run, RunStatus, RuntimeTask,
-    SandboxBackend, SandboxLimits, SandboxNetworkPolicy, SandboxResult, SandboxTermination,
-    SandboxUser, SandboxWorkingDirectory, Sha256Digest, UtcTimestamp,
+    SandboxBackend, SandboxCommand, SandboxLimits, SandboxNetworkPolicy, SandboxResult,
+    SandboxTermination, SandboxUser, SandboxWorkingDirectory, Sha256Digest, UtcTimestamp,
 };
 use openwork_runtime::task::{
     CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, ClaudeTaskAdapter, CodexTaskAdapter, OPENCODE_RUNTIME_ID,
-    OpenCodeTaskAdapter, PI_RUNTIME_ID, PiTaskAdapter, RuntimeTaskAdapter, decode_sandbox_result,
-    into_sandbox_request,
+    OpenCodeTaskAdapter, PI_RUNTIME_ID, PiTaskAdapter, RuntimeInvocation, RuntimeTaskAdapter,
+    decode_sandbox_result, into_sandbox_request,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -439,6 +439,10 @@ impl<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter + ?Sized>
     /// verifiable sandbox cancellation fails the run closed instead of claiming
     /// it is cancelled.
     ///
+    /// Runtime authentication and model routing are inherited from the host
+    /// process through a fixed allowlist so credentials never enter an image
+    /// layer.
+    ///
     /// # Errors
     ///
     /// Returns an error after best-effort lease-bound failure persistence.
@@ -494,6 +498,10 @@ impl<'a, S: WorkerLeaseStore, B: SandboxBackend, A: RuntimeTaskAdapter + ?Sized>
             return self.fail_after_error(running, error, now);
         }
         let invocation = match self.adapter.prepare(&task) {
+            Ok(invocation) => invocation,
+            Err(error) => return self.fail_after_error(running, error, now),
+        };
+        let invocation = match inherit_provider_environment(invocation) {
             Ok(invocation) => invocation,
             Err(error) => return self.fail_after_error(running, error, now),
         };
@@ -777,6 +785,53 @@ fn is_supported_runtime(runtime: &str) -> bool {
         runtime,
         CODEX_RUNTIME_ID | CLAUDE_RUNTIME_ID | OPENCODE_RUNTIME_ID | PI_RUNTIME_ID
     )
+}
+
+/// Host environment entries inherited by provider sandboxes.  An
+/// already-authenticated runtime and its model routing reach the container
+/// through the sandbox env file without secrets entering an image layer.
+/// Only the fixed names below cross the boundary; values are bounded to the
+/// sandbox contract that both the worker and the executor enforce.
+const PROVIDER_HOST_ENVIRONMENT: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+];
+
+fn inherit_provider_environment(
+    invocation: RuntimeInvocation,
+) -> Result<RuntimeInvocation, OpenWorkError> {
+    let mut environment = invocation.command.environment().clone();
+    collect_provider_environment(&mut environment, |key| std::env::var_os(key));
+    let command = SandboxCommand::with_stdin(
+        invocation.command.program().to_owned(),
+        invocation.command.arguments().to_vec(),
+        environment,
+        invocation.stdin.clone(),
+    )?;
+    Ok(RuntimeInvocation {
+        command,
+        working_directory: invocation.working_directory.clone(),
+        stdin: invocation.stdin,
+        output_protocol: invocation.output_protocol,
+    })
+}
+
+fn collect_provider_environment(
+    environment: &mut BTreeMap<String, String>,
+    mut source: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) {
+    for key in PROVIDER_HOST_ENVIRONMENT {
+        if let Some(value) = source(key) {
+            environment.insert((*key).to_owned(), value.to_string_lossy().into_owned());
+        }
+    }
 }
 
 fn validate_environment(
@@ -1130,6 +1185,24 @@ mod tests {
             capabilities: vec!["filesystem.read".to_owned()],
         }
     }
+    #[test]
+    fn provider_environment_collection_includes_only_the_fixed_allowlist() {
+        let mut environment = BTreeMap::new();
+        collect_provider_environment(&mut environment, |key| {
+            match key {
+                "ANTHROPIC_BASE_URL" => Some(std::ffi::OsString::from("https://example.invalid")),
+                // A host variable outside the allowlist must not cross the boundary.
+                "ANYTHING_ELSE" => Some(std::ffi::OsString::from("must-not-cross")),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            environment.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://example.invalid")
+        );
+        assert_eq!(environment.get("ANYTHING_ELSE"), None);
+    }
+
     fn environment() -> WorkerEnvironment {
         let root = tempfile::tempdir().expect("tempdir").keep();
         let input = root.join("input");
