@@ -61,7 +61,7 @@ pub struct OfficeDemoConfig {
     pub output_root: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OfficeArtifactReport {
     pub path: RelativeArtifactPath,
     pub media_type: String,
@@ -69,7 +69,7 @@ pub struct OfficeArtifactReport {
     pub sha256: Sha256Digest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OfficeDemoReport {
     pub run_id: RunId,
     pub status: RunStatus,

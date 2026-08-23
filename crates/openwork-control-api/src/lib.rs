@@ -15,11 +15,17 @@ use axum::{
 use openwork_apps::{
     AppId, AppProvider, AppRegistry, AvailableApp, CapabilityDescriptor, InstalledApp,
 };
-use openwork_core::ErrorCode;
+use openwork_core::{ErrorCode, OpenWorkError};
+use openwork_e2e::{
+    office_demo::{
+        OfficeDemoConfig, OfficePlan, PresentationPlan, SlidePlan, SpreadsheetPlan, run_office_demo,
+    },
+    sales_demo::{SalesDemoConfig, run_sales_demo},
+};
 use openwork_execution::{
     ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    ApprovalStatus, DEFAULT_MAX_ARTIFACT_BYTES, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus,
-    Sha256Digest, UtcTimestamp,
+    ApprovalStatus, DEFAULT_MAX_ARTIFACT_BYTES, DigestPinnedImageRef, EXECUTION_SCHEMA_VERSION,
+    Run, RunId, RunStatus, Sha256Digest, UtcTimestamp,
     action_executor::{ActionExecutionReceipt, ClaimedAction},
     approval::ApprovalRepository,
     artifact::ArtifactScanner,
@@ -64,6 +70,63 @@ pub struct Config {
     pub workspace_root: PathBuf,
     worker: Option<worker_runtime::WorkerRuntimeConfig>,
     connectors: connector_runtime::ConnectorRuntimeConfig,
+    demo: DemoConfig,
+}
+
+/// Real-container demo configuration (sales sandbox + `LibreOffice` office
+/// bundle). Request-time optional so the API still starts without Docker or an
+/// office image; each demo reports a clean 503 when unavailable.
+#[derive(Clone)]
+pub struct DemoConfig {
+    engine_bin: PathBuf,
+    sales_image: DigestPinnedImageRef,
+    libreoffice_image: Option<DigestPinnedImageRef>,
+    output_root: PathBuf,
+}
+
+const SALES_DEMO_IMAGE: &str = "docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0";
+
+impl DemoConfig {
+    fn disabled() -> Self {
+        Self {
+            // Guaranteed-missing path keeps unit tests offline and hermetic.
+            engine_bin: PathBuf::from("/nonexistent/docker-bin"),
+            sales_image: DigestPinnedImageRef::parse(SALES_DEMO_IMAGE)
+                .expect("static sales demo image must be a valid digest reference"),
+            libreoffice_image: None,
+            output_root: PathBuf::from("/tmp/openwork-demo-disabled"),
+        }
+    }
+
+    fn from_env(workspace_root: &FsPath) -> Result<Self, ConfigError> {
+        let engine_bin = env::var_os("OPENWORK_DEMO_DOCKER_BIN")
+            .or_else(|| env::var_os("OPENWORK_DOCKER_BIN"))
+            .map_or_else(|| PathBuf::from("/usr/local/bin/docker"), PathBuf::from);
+        if !engine_bin.is_absolute() {
+            return Err(ConfigError("OPENWORK_DEMO_DOCKER_BIN must be absolute"));
+        }
+        let sales_image = match env::var("OPENWORK_SALES_SANDBOX_IMAGE") {
+            Ok(raw) => DigestPinnedImageRef::parse(&raw)
+                .map_err(|_| ConfigError("OPENWORK_SALES_SANDBOX_IMAGE must be digest-pinned"))?,
+            Err(_) => DigestPinnedImageRef::parse(SALES_DEMO_IMAGE)
+                .expect("static sales demo image must be a valid digest reference"),
+        };
+        let libreoffice_image = match env::var("OPENWORK_LIBREOFFICE_IMAGE") {
+            Ok(raw) => Some(
+                DigestPinnedImageRef::parse(&raw)
+                    .map_err(|_| ConfigError("OPENWORK_LIBREOFFICE_IMAGE must be digest-pinned"))?,
+            ),
+            Err(_) => None,
+        };
+        let output_root = env::var_os("OPENWORK_DEMO_OUTPUT_ROOT")
+            .map_or_else(|| workspace_root.join("demo-output"), PathBuf::from);
+        Ok(Self {
+            engine_bin,
+            sales_image,
+            libreoffice_image,
+            output_root,
+        })
+    }
 }
 
 impl Config {
@@ -95,6 +158,7 @@ impl Config {
         let workspace_root = canonical_workspace_root(&workspace_root)?;
         let worker = worker_runtime::WorkerRuntimeConfig::from_env()?;
         let connectors = connector_runtime::ConnectorRuntimeConfig::from_env()?;
+        let demo = DemoConfig::from_env(&workspace_root)?;
         Ok(Self {
             bind,
             database_url,
@@ -103,6 +167,7 @@ impl Config {
             workspace_root,
             worker,
             connectors,
+            demo,
         })
     }
 }
@@ -151,6 +216,7 @@ struct AppState {
     app_registry: Arc<AppRegistry>,
     installed_apps: Arc<Mutex<BTreeMap<String, InstalledApp>>>,
     admin_settings: Arc<Mutex<AdminSettings>>,
+    demo: Arc<DemoConfig>,
 }
 
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -176,6 +242,7 @@ struct RouterDependencies {
     worker_runtimes: BTreeSet<String>,
     worker_ready: Arc<AtomicBool>,
     connectors: Arc<ConnectorRegistry>,
+    demo: DemoConfig,
 }
 
 /// One-time, fail-closed prompt retrieval boundary for a durable worker.
@@ -589,6 +656,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 worker_runtimes,
                 worker_ready,
                 connectors,
+                demo: config.demo,
             },
         ),
     )
@@ -636,6 +704,7 @@ pub fn router_with_prompt_boundary(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            demo: DemoConfig::disabled(),
         },
     )
 }
@@ -659,6 +728,7 @@ fn router_with_cancellation(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            demo: DemoConfig::disabled(),
         },
     )
 }
@@ -684,6 +754,7 @@ fn router_with_dependencies(
         app_registry: Arc::new(load_app_registry()),
         installed_apps: Arc::new(Mutex::new(BTreeMap::new())),
         admin_settings: Arc::new(Mutex::new(AdminSettings::default())),
+        demo: Arc::new(dependencies.demo),
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -708,6 +779,7 @@ fn router_with_dependencies(
             "/apps/{id}/capabilities/{capability}/invoke",
             post(invoke_capability),
         )
+        .route("/admin/demo-sales", post(demo_sales))
         .route("/files", get(list_files).post(upload_file))
         .route("/admin/runtimes", get(list_admin_runtimes))
         .route(
@@ -929,8 +1001,8 @@ async fn invoke_capability(
     let capability_id = descriptor.id.as_str().to_owned();
     let risk = descriptor.risk;
     let connector = match &descriptor.provider {
-        AppProvider::Mcp { connector } => connector.clone(),
-        _ => return Err(ApiError::unavailable("capability_dispatch_unavailable")),
+        AppProvider::Mcp { connector } => Some(connector.clone()),
+        _ => None,
     };
     {
         let installs = state
@@ -946,7 +1018,7 @@ async fn invoke_capability(
         openwork_execution::RiskLevel::ExternalEffect
             | openwork_execution::RiskLevel::DestructiveOrFinancial
     ) {
-        if capability_id != "github.issue.create" || connector != "github" {
+        if capability_id != "github.issue.create" || connector.as_deref() != Some("github") {
             return Err(ApiError::unavailable("capability_dispatch_unavailable"));
         }
         validate_github_issue_create(&request.parameters)?;
@@ -974,7 +1046,15 @@ async fn invoke_capability(
             })),
         ));
     }
-    if connector != "github" {
+    if connector.as_deref() != Some("github") {
+        // Local-write CLI-anything capabilities (LibreOffice bundle) dispatch
+        // through the in-process demo harness; the M1 policy permits L0/L1
+        // without an approval window.
+        if matches!(&descriptor.provider, AppProvider::Cli { adapter } if adapter == "cli-anything")
+        {
+            return dispatch_libreoffice(&state, &app_id, &capability_id, descriptor, &request)
+                .await;
+        }
         return Err(ApiError::unavailable("capability_dispatch_unavailable"));
     }
     let connectors = Arc::clone(&state.connectors);
@@ -995,6 +1075,113 @@ async fn invoke_capability(
         Json(
             json!({"status":"completed", "app_id":app_id, "capability":capability_id, "output":output}),
         ),
+    ))
+}
+
+const LIBREOFFICE_BUNDLE_CAPABILITY: &str = "libreoffice.office_bundle.create";
+
+/// Dispatches the `LibreOffice` CLI-anything capability through the in-process
+/// real-container demo harness. L0/L1 only: the M1 policy permits local-write
+/// actions without an approval window; L3+ never reaches this branch.
+async fn dispatch_libreoffice(
+    state: &AppState,
+    app_id: &str,
+    capability_id: &str,
+    descriptor: &CapabilityDescriptor,
+    request: &CapabilityInvokeRequest,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if descriptor.id.as_str() != LIBREOFFICE_BUNDLE_CAPABILITY {
+        return Err(ApiError::unavailable("capability_dispatch_unavailable"));
+    }
+    let image = state
+        .demo
+        .libreoffice_image
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("demo_not_configured"))?;
+    let plan = office_plan_from_parameters(&request.parameters)?;
+    let config = OfficeDemoConfig {
+        engine_bin: state.demo.engine_bin.clone(),
+        image,
+        output_root: state.demo.output_root.clone(),
+    };
+    let report = tokio::task::spawn_blocking(move || run_office_demo(config, plan))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(|error| office_demo_error(&error))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            json!({"status":"completed", "app_id":app_id, "capability":capability_id,
+                "driver":"libreoffice-demo", "output":report}),
+        ),
+    ))
+}
+
+/// Converts invoke parameters into the office demo plan. The registry schema
+/// for `office_bundle.create` only requires `{}`; an empty object selects the
+/// same deterministic plan as the gated e2e test.
+fn office_plan_from_parameters(parameters: &Value) -> Result<OfficePlan, ApiError> {
+    if parameters
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        return Ok(office_default_plan());
+    }
+    serde_json::from_value(parameters.clone())
+        .map_err(|_| ApiError::invalid("invalid_capability_parameters"))
+}
+
+fn office_default_plan() -> OfficePlan {
+    OfficePlan {
+        title: "OpenWork Quarterly Review".to_owned(),
+        spreadsheet: SpreadsheetPlan {
+            filename: "quarterly-review.xlsx".to_owned(),
+            sheet: "Summary".to_owned(),
+            rows: vec![
+                vec!["Metric".to_owned(), "Q1".to_owned(), "Q2".to_owned()],
+                vec!["Revenue".to_owned(), "120".to_owned(), "148".to_owned()],
+                vec!["Orders".to_owned(), "42".to_owned(), "51".to_owned()],
+            ],
+        },
+        presentation: PresentationPlan {
+            filename: "quarterly-briefing.pptx".to_owned(),
+            slides: vec![
+                SlidePlan {
+                    title: "Quarterly Review".to_owned(),
+                    content: "Revenue and order growth".to_owned(),
+                },
+                SlidePlan {
+                    title: "Next steps".to_owned(),
+                    content: "Review pipeline and customer follow-up".to_owned(),
+                },
+            ],
+        },
+    }
+}
+
+fn office_demo_error(error: &OpenWorkError) -> ApiError {
+    match error.code {
+        ErrorCode::SandboxUnavailable => ApiError::unavailable("demo_sandbox_unavailable"),
+        _ => ApiError::unavailable("demo_unavailable"),
+    }
+}
+
+/// Runs the deterministic sales sandbox demo (busybox, no email, no external
+/// service) and reports run evidence for the workspace UI.
+async fn demo_sales(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let config = (*state.demo).clone();
+    let report = tokio::task::spawn_blocking(move || {
+        run_sales_demo(SalesDemoConfig {
+            engine_bin: config.engine_bin,
+            image: config.sales_image,
+            output_root: Some(config.output_root.join("sales")),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(|error| office_demo_error(&error))?;
+    Ok(Json(
+        serde_json::to_value(report).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -2224,6 +2411,31 @@ mod tests {
             .await
             .expect("router response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn demo_sales_fails_closed_without_a_configured_demo_engine() {
+        let response = test_router(PathBuf::from("."))
+            .oneshot(request(Method::POST, "/v1/admin/demo-sales", "", true))
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn office_plan_from_empty_parameters_uses_the_deterministic_default() {
+        let plan = office_plan_from_parameters(&json!({})).expect("default office plan");
+        assert_eq!(plan.title, "OpenWork Quarterly Review");
+        assert_eq!(plan.spreadsheet.rows.len(), 3);
+        assert_eq!(plan.presentation.slides.len(), 2);
+    }
+
+    #[test]
+    fn office_plan_rejects_unknown_parameters() {
+        match office_plan_from_parameters(&json!({"unknown": true})) {
+            Err(ApiError(status, _)) => assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY),
+            Ok(_) => panic!("unknown office plan keys must be rejected"),
+        }
     }
 
     #[tokio::test]

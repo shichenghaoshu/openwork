@@ -43,8 +43,7 @@ capabilities:
         owner: { type: string, minLength: 1, maxLength: 128 }
         repo: { type: string, minLength: 1, maxLength: 128 }
         state: { type: string, enum: [OPEN, CLOSED] }
-        page: { type: integer, minimum: 1 }
-        perPage: { type: integer, minimum: 1, maximum: 100 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
   - id: github.actions.read
     description: Read workflow run status and logs.
     risk: L0
