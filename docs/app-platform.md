@@ -99,5 +99,19 @@ npm run dev
 
 The desktop bridge exposes only fixed routes. Uploads are bounded to 8 MiB;
 selected files are copied into the chosen workspace and mounted read-only for
-the task. Task detail polls the real run, artifacts, action audit, and approval
-records rather than using sample data.
+the task. Task detail polls the real run, artifacts, action audit, approval
+records, and the per-run audit event chain rather than using sample data.
+
+The renderer is bilingual: the header switch toggles zh-CN/English and the
+choice persists in `localStorage`. From the Apps page, employees can invoke
+reviewed capabilities with parameter forms generated from each capability's
+JSON schema; `github.issue.create` shows the required owner/repo/title/body
+fields and routes the request into the durable approval flow, which the
+Approvals page executes with a dedicated Execute button after approval. The
+Workspace page can run the real-container sales demo, and the sample report
+lists its artifacts and audit evidence. `LibreOffice` capability invocation
+uses the demo harness path (`OPENWORK_LIBREOFFICE_IMAGE` required; a missing
+image returns a clean `demo_not_configured` 503), which covers
+`libreoffice.office_bundle.create` only. The Connectors page shows connector
+status and the tool allowlist (Feishu is reported as `not_configured` until
+tenant credentials are supplied).

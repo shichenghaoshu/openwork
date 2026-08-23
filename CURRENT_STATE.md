@@ -5,9 +5,15 @@ This is the repository's evidence-scoped status source. It was refreshed on
 
 ## Working
 
-- Employee Workspace has Workspace, Tasks, Files, Apps, and Approvals, plus
-  administrator Runtime, App Store, and Settings views. Its Electron renderer
+- Employee Workspace has Workspace, Tasks, Files, Apps, Approvals, and
+  Connectors, plus administrator Runtime, App Store, and Settings views. The
+  renderer is bilingual (zh-CN/EN switch persisted in localStorage), and it
   receives neither the Control API bearer token nor an arbitrary HTTP bridge.
+- Apps can invoke reviewed capabilities directly: parameter forms are generated
+  from each capability's JSON schema, `github.issue.create` runs through the
+  durable approval flow with an in-app Execute step, and a Connectors page
+  shows live connector status and the tool allowlist. Workspace runs the
+  real-container sales demo and Tasks shows the per-run audit event chain.
 - Uploaded files are content-addressed, bounded to 8 MiB, selected by exact ID,
   copied into a root-bounded workspace input directory, and presented to the
   sandbox as read-only task inputs.
@@ -42,6 +48,11 @@ This is the repository's evidence-scoped status source. It was refreshed on
   `openwork doctor` expose the runtime and reviewed local App inventory.
 - Postgres worker leases, heartbeat, cancellation intent/evidence, recovery,
   approvals, artifacts, and hash-chain audit remain the durable execution base.
+- The worker inherits provider authentication and model routing from the host
+  process through a fixed environment allowlist, so credentials never enter an
+  image layer or the logs. Both demos (sales sandbox and `LibreOffice` bundle)
+  are real-container harnesses exposed through authenticated routes that fail
+  closed with a clean 503 when Docker or the office image is not configured.
 
 ## Real-host verified
 
@@ -59,6 +70,12 @@ This is the repository's evidence-scoped status source. It was refreshed on
   consumed, action-executed, and run-completed audit events.
 - The pre-existing real Docker sales demo and Postgres transaction/lease suites
   remain available as separate execution-control evidence.
+- WSL2 (Docker 29.7.2) with the zh-CN/EN bilingual Employee Workspace: the
+  worker-mode Control API completed a real claude-code task, the suite of three
+  GitHub read capabilities (issue, actions, pull-request) and the L3 issue
+  creation flow (issues #109 and #110 created), a `LibreOffice`
+  `office_bundle.create` invocation, the sales demo endpoint, and connector
+  discovery (43 GitHub tools; Feishu honestly reported as not configured).
 
 ## Contract or fixture verified only
 
@@ -93,3 +110,14 @@ This is the repository's evidence-scoped status source. It was refreshed on
 - Enterprise pilot readiness still requires target-provider and Feishu live
   validation, secret-store integration, deployment observability, backup/restore,
   and external security review.
+- Capability dispatch covers GitHub MCP reads, the L3 issue-creation approval
+  flow, and the LibreOffice bundle demo path only. Other CLI-anything
+  capabilities and Feishu invocations fail closed with
+  `capability_dispatch_unavailable`; Feishu remains tool-discovery only.
+- `github.issue.read` maps to the GitHub MCP v1.10 `list_issues` tool, which
+  uses cursor pagination: the OpenWork schema exposes `limit` for the first
+  page, and `page > 1` is rejected with an exact 422. Other read tools accept
+  the current parameters unchanged.
+- Connector failures use a short in-process negative cache (15 s); a transient
+  provider failure can surface once and then succeed moments later, which the
+  Workspace surfaces without hiding the server error.

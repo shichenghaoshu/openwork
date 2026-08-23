@@ -44,3 +44,24 @@ section use the action-level decision.
 `REQUIRE_APPROVAL` evaluations carry the exact canonical parameter hash from
 the frozen action contract. Any action, resource, or integer-only parameter
 change produces a different binding and requires reevaluation.
+
+## Managed-action dispatch (v0.1)
+
+The control plane dispatches exactly these reviewed capability actions; every
+other invocation fails closed with `capability_dispatch_unavailable`:
+
+- GitHub MCP read mappings through the digest-pinned official `github-mcp-server`
+  container (`repository.read`, `file.read`, `issue.read`, `actions.read`,
+  `pull_request.read`), with `github.issue.create` (L3) gated behind the
+  single-use approval claim described above;
+- the `LibreOffice` `office_bundle.create` demo path (L1, local write) through
+  the in-process real-container harness also used by the gated e2e test, which
+  requires `OPENWORK_LIBREOFFICE_IMAGE` and returns `demo_not_configured` when
+  it is absent;
+- connector tool discovery for the GitHub MCP container and the Feishu read-only
+  allowlist (`/v1/connectors/{id}/tools`). Feishu business invocation is not
+  routed in v0.1.
+
+The CLI provider accepts only a gateway authorization with parameters on
+bounded stdin, network disabled, and an exact single-run sandbox; it never
+exposes a host shell path.
