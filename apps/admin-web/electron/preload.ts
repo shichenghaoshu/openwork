@@ -32,6 +32,13 @@ const api = {
   getSettings: (): Promise<BridgeResponse> => ipcRenderer.invoke('control:getSettings'),
   updateSettings: (body: { default_runtime: string }): Promise<BridgeResponse> =>
     ipcRenderer.invoke('control:updateSettings', body),
+  listCredentials: (): Promise<BridgeResponse> => ipcRenderer.invoke('control:listCredentials'),
+  createCredential: (body: { credential_ref: string; provider: string; environment_variable: string; scope: string; owner: string; value: string; expires_at?: string }): Promise<BridgeResponse> =>
+    ipcRenderer.invoke('control:createCredential', body),
+  rotateCredential: (id: string, value: string): Promise<BridgeResponse> =>
+    ipcRenderer.invoke('control:rotateCredential', id, value),
+  revokeCredential: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:revokeCredential', id),
+  enableCredential: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:enableCredential', id),
 }
 
 export type OpenworkApi = typeof api

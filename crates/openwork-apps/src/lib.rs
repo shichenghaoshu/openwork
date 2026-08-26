@@ -9,6 +9,10 @@ pub mod gateway;
 pub mod importer;
 pub mod provider;
 
+pub use credential::{
+    CredentialBroker, CredentialMetadata, CredentialProvider, EnvCredentialProvider,
+    MemorySecretStore, ScopedCredential, SecretStore, SecretStoreEntry,
+};
 pub use gateway::{
     CapabilityAuthorization, CapabilityAuthorizationResult, CapabilityGateway,
     PendingCapabilityApproval,

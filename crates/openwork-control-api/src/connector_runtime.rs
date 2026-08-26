@@ -15,6 +15,7 @@ use std::{
 };
 
 use crate::ConfigError;
+use openwork_apps::{ScopedCredential, SecretStore};
 use openwork_execution::action_executor::ClaimedAction;
 
 const GITHUB_IMAGE: &str = "ghcr.io/github/github-mcp-server@sha256:1817b57d43916532dc002bdc5f344d639bd9fb54a9148d42168458f7c3280567";
@@ -77,9 +78,15 @@ pub(super) struct ConnectorRegistry {
     cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
     success_ttl: Duration,
     failure_ttl: Duration,
+    secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 impl ConnectorRegistry {
+    /// Registry over static connector definitions without a credential store.
+    ///
+    /// This is the test- and fixture-facing constructor; production builds the
+    /// registry through [`ConnectorRegistry::with_secret_store`].
+    #[cfg(test)]
     pub(super) fn new(config: ConnectorRuntimeConfig) -> Self {
         let entries = config
             .definitions
@@ -91,6 +98,33 @@ impl ConnectorRegistry {
             cache: Arc::new(Mutex::new(HashMap::new())),
             success_ttl: Duration::from_mins(1),
             failure_ttl: Duration::from_secs(15),
+            secret_store: None,
+        }
+    }
+
+    /// Builds the registry on top of the reviewed credential boundary.
+    ///
+    /// When a connector definition carries a credential slot, the store is
+    /// authoritative: a stored credential is always used, and a revoked or
+    /// expired stored credential makes the connector unavailable without
+    /// falling back to operator environment configuration.
+    #[must_use]
+    pub(super) fn with_secret_store(
+        config: ConnectorRuntimeConfig,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Self {
+        Self {
+            entries: Arc::new(
+                config
+                    .definitions
+                    .into_iter()
+                    .map(|entry| (entry.id.clone(), entry))
+                    .collect(),
+            ),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            success_ttl: Duration::from_mins(1),
+            failure_ttl: Duration::from_secs(15),
+            secret_store: Some(secret_store),
         }
     }
 
@@ -100,7 +134,34 @@ impl ConnectorRegistry {
             cache: Arc::new(Mutex::new(HashMap::new())),
             success_ttl: Duration::from_mins(1),
             failure_ttl: Duration::from_secs(15),
+            secret_store: None,
         }
+    }
+
+    /// Resolves the exact process configuration for one connector, injecting
+    /// the reviewed credential only after the store authorizes it.
+    fn process_config(
+        &self,
+        entry: &ConnectorDefinition,
+    ) -> Option<(ProcessConfig, Option<ScopedCredential>)> {
+        let config = entry.process.clone()?;
+        let Some(credential_ref) = entry.credential_ref.as_deref() else {
+            return Some((config, None));
+        };
+        let Some(store) = self.secret_store.as_deref() else {
+            return Some((config, None));
+        };
+        if store.metadata(credential_ref).is_err() {
+            // No reviewed credential: fall back to the connector's static
+            // operator environment configuration.
+            return Some((config, None));
+        }
+        // The store owns this credential's lifecycle. A revoked or expired
+        // stored credential is authoritative and never falls back.
+        store
+            .resolve(credential_ref)
+            .ok()
+            .map(|credential| (config, Some(credential)))
     }
 
     pub(super) fn summaries(&self) -> Vec<ConnectorSummary> {
@@ -141,7 +202,9 @@ impl ConnectorRegistry {
 
     pub(super) fn tools(&self, id: &str) -> Result<Vec<ConnectorTool>, LookupError> {
         let entry = self.entries.get(id).ok_or(LookupError::NotFound)?;
-        let process = entry.process.as_ref().ok_or(LookupError::NotConfigured)?;
+        let (process, credential) = self
+            .process_config(entry)
+            .ok_or(LookupError::NotConfigured)?;
         let now = Instant::now();
         if let Some(cached) = self
             .cache
@@ -154,7 +217,7 @@ impl ConnectorRegistry {
             return cached.result.map_err(|_| LookupError::Unavailable);
         }
 
-        let result = discover_tools(process);
+        let result = discover_tools(&process, credential.as_ref());
         let ttl = if result.is_ok() {
             self.success_ttl
         } else {
@@ -184,8 +247,15 @@ impl ConnectorRegistry {
         let mapping = github_mapping(capability).ok_or(CallError::CapabilityNotMapped)?;
         let arguments = github_arguments(mapping, parameters)?;
         let entry = self.entries.get("github").ok_or(CallError::Unavailable)?;
-        let process = entry.process.as_ref().ok_or(CallError::NotConfigured)?;
-        call_tool(process, mapping.tool, &arguments, mapping.read_only).map_err(CallError::from)
+        let (process, credential) = self.process_config(entry).ok_or(CallError::NotConfigured)?;
+        call_tool(
+            &process,
+            credential.as_ref(),
+            mapping.tool,
+            &arguments,
+            mapping.read_only,
+        )
+        .map_err(CallError::from)
     }
 }
 
@@ -281,6 +351,8 @@ struct ConnectorDefinition {
     id: String,
     name: String,
     process: Option<ProcessConfig>,
+    /// Reviewed credential slot consulted before every process launch.
+    credential_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -334,101 +406,116 @@ impl McpError {
 }
 
 fn github_from_env() -> Result<ConnectorDefinition, ConfigError> {
-    let token = optional_nonempty_env("OPENWORK_GITHUB_TOKEN");
-    let process = token
-        .map(|token| {
-            let executable =
-                absolute_executable("OPENWORK_GITHUB_MCP_DOCKER_BIN", "/usr/local/bin/docker")?;
-            let mut environment = BTreeMap::from([
-                (
-                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_owned(),
-                    SecretValue(token),
-                ),
-                (
-                    "GITHUB_TOOLSETS".to_owned(),
-                    SecretValue("repos,issues,pull_requests,actions,users".to_owned()),
-                ),
-            ]);
-            if let Some(host) = optional_nonempty_env("OPENWORK_DOCKER_HOST") {
-                environment.insert("DOCKER_HOST".to_owned(), SecretValue(host));
-            }
-            let mut args = vec!["run".to_owned(), "-i".to_owned(), "--rm".to_owned()];
-            for key in environment
-                .keys()
-                .filter(|key| key.as_str() != "DOCKER_HOST")
-            {
-                args.push("-e".to_owned());
-                args.push(key.clone());
-            }
-            args.push(GITHUB_IMAGE.to_owned());
-            Ok(ProcessConfig {
-                executable,
-                args,
-                environment,
-                timeout: Duration::from_secs(20),
-            })
-        })
-        .transpose()?;
+    let Some(executable) =
+        optional_absolute_executable("OPENWORK_GITHUB_MCP_DOCKER_BIN", "/usr/local/bin/docker")?
+    else {
+        return Ok(ConnectorDefinition {
+            id: "github".to_owned(),
+            name: "GitHub".to_owned(),
+            process: None,
+            credential_ref: Some("github.app".to_owned()),
+        });
+    };
+    let mut environment = BTreeMap::from([(
+        "GITHUB_TOOLSETS".to_owned(),
+        SecretValue("repos,issues,pull_requests,actions,users".to_owned()),
+    )]);
+    if let Some(host) = optional_nonempty_env("OPENWORK_DOCKER_HOST") {
+        environment.insert("DOCKER_HOST".to_owned(), SecretValue(host));
+    }
+    // Legacy operator configuration remains a fallback: a reviewed credential
+    // stored in the SecretStore is authoritative and injected at launch.
+    if let Some(token) = optional_nonempty_env("OPENWORK_GITHUB_TOKEN") {
+        environment.insert(
+            "GITHUB_PERSONAL_ACCESS_TOKEN".to_owned(),
+            SecretValue(token),
+        );
+    }
+    let mut args = vec!["run".to_owned(), "-i".to_owned(), "--rm".to_owned()];
+    for key in environment
+        .keys()
+        .filter(|key| key.as_str() != "DOCKER_HOST")
+    {
+        args.push("-e".to_owned());
+        args.push(key.clone());
+    }
+    args.push(GITHUB_IMAGE.to_owned());
     Ok(ConnectorDefinition {
         id: "github".to_owned(),
         name: "GitHub".to_owned(),
-        process,
+        process: Some(ProcessConfig {
+            executable,
+            args,
+            environment,
+            timeout: Duration::from_secs(20),
+        }),
+        credential_ref: Some("github.app".to_owned()),
     })
 }
 
 fn lark_from_env() -> Result<ConnectorDefinition, ConfigError> {
     let app_id = optional_nonempty_env("OPENWORK_LARK_APP_ID");
     let app_secret = optional_nonempty_env("OPENWORK_LARK_APP_SECRET");
-    let process = match (app_id, app_secret) {
-        (None, None) => None,
-        (Some(app_id), Some(app_secret)) => {
-            let executable =
-                absolute_executable("OPENWORK_LARK_MCP_NPX_BIN", "/usr/local/bin/npx")?;
-            let domain = optional_nonempty_env("OPENWORK_LARK_DOMAIN")
-                .unwrap_or_else(|| "https://open.feishu.cn".to_owned());
-            let mut environment = BTreeMap::from([
-                ("APP_ID".to_owned(), SecretValue(app_id)),
-                ("APP_SECRET".to_owned(), SecretValue(app_secret)),
-                (
-                    "LARK_TOOLS".to_owned(),
-                    SecretValue(LARK_READ_TOOLS.to_owned()),
-                ),
-                ("LARK_DOMAIN".to_owned(), SecretValue(domain)),
-                (
-                    "LARK_TOKEN_MODE".to_owned(),
-                    SecretValue("tenant_access_token".to_owned()),
-                ),
-                (
-                    "PATH".to_owned(),
-                    SecretValue("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_owned()),
-                ),
-            ]);
-            if let Some(home) = optional_nonempty_env("HOME") {
-                environment.insert("HOME".to_owned(), SecretValue(home));
-            }
-            Some(ProcessConfig {
-                executable,
-                args: vec![
-                    "-y".to_owned(),
-                    LARK_PACKAGE.to_owned(),
-                    "mcp".to_owned(),
-                    "--token-mode".to_owned(),
-                    "tenant_access_token".to_owned(),
-                ],
-                environment,
-                timeout: Duration::from_secs(30),
-            })
-        }
-        _ => {
-            return Err(ConfigError(
-                "OPENWORK_LARK_APP_ID and OPENWORK_LARK_APP_SECRET must be set together",
-            ));
-        }
+    if app_id.is_none() && app_secret.is_none() {
+        return Ok(ConnectorDefinition {
+            id: "lark".to_owned(),
+            name: "Feishu / Lark".to_owned(),
+            process: None,
+            credential_ref: Some("feishu.app".to_owned()),
+        });
+    }
+    let Some(executable) =
+        optional_absolute_executable("OPENWORK_LARK_MCP_NPX_BIN", "/usr/local/bin/npx")?
+    else {
+        return Ok(ConnectorDefinition {
+            id: "lark".to_owned(),
+            name: "Feishu / Lark".to_owned(),
+            process: None,
+            credential_ref: Some("feishu.app".to_owned()),
+        });
     };
+    let domain = optional_nonempty_env("OPENWORK_LARK_DOMAIN")
+        .unwrap_or_else(|| "https://open.feishu.cn".to_owned());
+    let mut environment = BTreeMap::from([
+        (
+            "LARK_TOOLS".to_owned(),
+            SecretValue(LARK_READ_TOOLS.to_owned()),
+        ),
+        ("LARK_DOMAIN".to_owned(), SecretValue(domain)),
+        (
+            "LARK_TOKEN_MODE".to_owned(),
+            SecretValue("tenant_access_token".to_owned()),
+        ),
+        (
+            "PATH".to_owned(),
+            SecretValue("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_owned()),
+        ),
+    ]);
+    if let Some(app_id) = app_id {
+        environment.insert("APP_ID".to_owned(), SecretValue(app_id));
+    }
+    if let Some(app_secret) = app_secret {
+        environment.insert("APP_SECRET".to_owned(), SecretValue(app_secret));
+    }
+    if let Some(home) = optional_nonempty_env("HOME") {
+        environment.insert("HOME".to_owned(), SecretValue(home));
+    }
     Ok(ConnectorDefinition {
         id: "lark".to_owned(),
         name: "Feishu / Lark".to_owned(),
-        process,
+        process: Some(ProcessConfig {
+            executable,
+            args: vec![
+                "-y".to_owned(),
+                LARK_PACKAGE.to_owned(),
+                "mcp".to_owned(),
+                "--token-mode".to_owned(),
+                "tenant_access_token".to_owned(),
+            ],
+            environment,
+            timeout: Duration::from_secs(30),
+        }),
+        credential_ref: Some("feishu.app".to_owned()),
     })
 }
 
@@ -436,16 +523,30 @@ fn optional_nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn absolute_executable(name: &'static str, default: &str) -> Result<PathBuf, ConfigError> {
+fn optional_absolute_executable(
+    name: &'static str,
+    default: &str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let explicit = env::var_os(name).is_some();
     let value = env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from);
     if !value.is_absolute() {
         return Err(ConfigError(name));
     }
-    Ok(value)
+    // An explicit override is always honored (a broken value fails at launch);
+    // an absent default leaves the connector unconfigured without failing
+    // control-plane startup.
+    if explicit || value.exists() {
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
 }
 
-fn discover_tools(config: &ProcessConfig) -> Result<Vec<ConnectorTool>, McpError> {
-    let mut child = spawn(config)?;
+fn discover_tools(
+    config: &ProcessConfig,
+    credential: Option<&ScopedCredential>,
+) -> Result<Vec<ConnectorTool>, McpError> {
+    let mut child = spawn(config, credential)?;
     let result = exchange(&mut child, config.timeout);
     // Discovery sessions are one-shot. Terminate even after success so a
     // normal long-lived stdio server cannot block this request in `wait`.
@@ -454,7 +555,7 @@ fn discover_tools(config: &ProcessConfig) -> Result<Vec<ConnectorTool>, McpError
     result
 }
 
-fn spawn(config: &ProcessConfig) -> Result<Child, McpError> {
+fn spawn(config: &ProcessConfig, credential: Option<&ScopedCredential>) -> Result<Child, McpError> {
     if !Path::new(&config.executable).is_absolute() {
         return Err(McpError::Spawn);
     }
@@ -467,6 +568,11 @@ fn spawn(config: &ProcessConfig) -> Result<Child, McpError> {
         .stderr(Stdio::piped());
     for (key, value) in &config.environment {
         command.env(key, &value.0);
+    }
+    // The reviewed credential is injected last, so a stored credential always
+    // wins over any static operator environment fallback.
+    if let Some(credential) = credential {
+        credential.inject_into_provider(&mut command);
     }
     command.spawn().map_err(|_| McpError::Spawn)
 }
@@ -530,11 +636,12 @@ fn exchange(child: &mut Child, timeout: Duration) -> Result<Vec<ConnectorTool>, 
 
 fn call_tool(
     config: &ProcessConfig,
+    credential: Option<&ScopedCredential>,
     expected_tool: &str,
     parameters: &Value,
     require_read_only: bool,
 ) -> Result<Value, McpError> {
-    let mut child = spawn(config)?;
+    let mut child = spawn(config, credential)?;
     let result = call_exchange(
         &mut child,
         config.timeout,
@@ -723,6 +830,68 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openwork_apps::MemorySecretStore;
+
+    #[test]
+    fn stored_credential_is_authoritative_and_revocation_fails_closed() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let definition = ConnectorDefinition {
+            id: "github".to_owned(),
+            name: "GitHub".to_owned(),
+            process: Some(ProcessConfig {
+                executable: PathBuf::from("/usr/bin/docker"),
+                args: Vec::new(),
+                environment: BTreeMap::new(),
+                timeout: Duration::from_secs(1),
+            }),
+            credential_ref: Some("github.app".to_owned()),
+        };
+        let registry = ConnectorRegistry::with_secret_store(
+            ConnectorRuntimeConfig {
+                definitions: vec![definition],
+            },
+            store.clone(),
+        );
+        let entry = registry
+            .entries
+            .get("github")
+            .expect("connector definition");
+        // No reviewed credential yet: the static operator configuration is used.
+        assert!(
+            registry
+                .process_config(entry)
+                .expect("fallback")
+                .1
+                .is_none()
+        );
+
+        store
+            .store(openwork_apps::SecretStoreEntry {
+                credential_ref: "github.app".to_owned(),
+                provider: "github".to_owned(),
+                environment_variable: "GITHUB_PERSONAL_ACCESS_TOKEN".to_owned(),
+                scope: "repos".to_owned(),
+                owner: "control-admin".to_owned(),
+                value: "github_app_token".to_owned(),
+                expires_at: None,
+            })
+            .expect("stored credential");
+        assert!(registry.process_config(entry).expect("stored").1.is_some());
+
+        // Rotation keeps the same authoritative store path.
+        store
+            .rotate("github.app", "new_token")
+            .expect("rotated credential");
+        assert!(registry.process_config(entry).expect("rotated").1.is_some());
+
+        // Revocation must be authoritative: no fallback to operator env.
+        store.revoke("github.app").expect("revoked credential");
+        assert!(registry.process_config(entry).is_none());
+
+        // Re-enabling restores the same store path.
+        store.enable("github.app").expect("enabled credential");
+        assert!(registry.process_config(entry).expect("enabled").1.is_some());
+    }
 
     #[test]
     fn github_capability_mapping_is_exact_and_rejects_arbitrary_tools() {

@@ -47,6 +47,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use connector_runtime::{CallError, ConnectorRegistry, LookupError};
+use openwork_apps::{CredentialMetadata, MemorySecretStore, SecretStore, SecretStoreEntry};
+use openwork_core::crypto::EnvironmentKeyProvider;
+use secret_store::PostgresSecretStore;
+
+mod secret_store;
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const PROMPT_DELIVERY_CAPACITY: usize = 128;
@@ -151,6 +156,7 @@ struct AppState {
     app_registry: Arc<AppRegistry>,
     installed_apps: Arc<Mutex<BTreeMap<String, InstalledApp>>>,
     admin_settings: Arc<Mutex<AdminSettings>>,
+    secret_store: Arc<dyn SecretStore>,
 }
 
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -176,6 +182,7 @@ struct RouterDependencies {
     worker_runtimes: BTreeSet<String>,
     worker_ready: Arc<AtomicBool>,
     connectors: Arc<ConnectorRegistry>,
+    secret_store: Arc<dyn SecretStore>,
 }
 
 /// One-time, fail-closed prompt retrieval boundary for a durable worker.
@@ -554,7 +561,12 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     store.recover_expired_leases(recovery_actor.clone(), recovery_time)?;
     store.recover_interrupted_runs(recovery_actor, recovery_time)?;
     let prompts = Arc::new(SharedPromptBoundary::production());
-    let connectors = Arc::new(ConnectorRegistry::new(config.connectors));
+    let keys: Arc<dyn openwork_core::crypto::KeyProvider> = Arc::new(EnvironmentKeyProvider::new());
+    let secret_store: Arc<dyn SecretStore> = Arc::new(PostgresSecretStore::new(pool.clone(), keys));
+    let connectors = Arc::new(ConnectorRegistry::with_secret_store(
+        config.connectors,
+        Arc::clone(&secret_store),
+    ));
     let worker = config
         .worker
         .map(|worker_config| {
@@ -589,6 +601,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 worker_runtimes,
                 worker_ready,
                 connectors,
+                secret_store,
             },
         ),
     )
@@ -636,6 +649,7 @@ pub fn router_with_prompt_boundary(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            secret_store: Arc::new(MemorySecretStore::new()),
         },
     )
 }
@@ -659,6 +673,7 @@ fn router_with_cancellation(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            secret_store: Arc::new(MemorySecretStore::new()),
         },
     )
 }
@@ -684,6 +699,7 @@ fn router_with_dependencies(
         app_registry: Arc::new(load_app_registry()),
         installed_apps: Arc::new(Mutex::new(BTreeMap::new())),
         admin_settings: Arc::new(Mutex::new(AdminSettings::default())),
+        secret_store: dependencies.secret_store,
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -714,6 +730,14 @@ fn router_with_dependencies(
             "/admin/settings",
             get(get_admin_settings).post(update_admin_settings),
         )
+        .route(
+            "/admin/credentials",
+            get(list_credentials).post(create_credential),
+        )
+        .route("/admin/credentials/{ref}", get(get_credential))
+        .route("/admin/credentials/{ref}/rotate", post(rotate_credential))
+        .route("/admin/credentials/{ref}/revoke", post(revoke_credential))
+        .route("/admin/credentials/{ref}/enable", post(enable_credential))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -1279,6 +1303,109 @@ async fn update_admin_settings(
         .map_err(|_| ApiError::internal())?;
     settings.default_runtime = request.default_runtime;
     Ok(Json(settings.clone()))
+}
+
+/// Admin credential operations. Responses carry metadata only; a raw value
+/// never leaves the [`SecretStore`] boundary and is never serialized here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCredentialRequest {
+    credential_ref: String,
+    provider: String,
+    environment_variable: String,
+    scope: String,
+    owner: String,
+    value: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateCredentialRequest {
+    value: String,
+}
+
+async fn list_credentials(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<CredentialMetadata>>, ApiError> {
+    state
+        .secret_store
+        .list()
+        .map(Json)
+        .map_err(|_| ApiError::internal())
+}
+
+async fn get_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .metadata(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn create_credential(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateCredentialRequest>,
+) -> Result<(StatusCode, Json<CredentialMetadata>), ApiError> {
+    let entry = SecretStoreEntry {
+        credential_ref: request.credential_ref,
+        provider: request.provider,
+        environment_variable: request.environment_variable,
+        scope: request.scope,
+        owner: request.owner,
+        value: request.value,
+        expires_at: parse_optional_timestamp(request.expires_at)?,
+    };
+    state
+        .secret_store
+        .store(entry)
+        .map(|metadata| (StatusCode::CREATED, Json(metadata)))
+        .map_err(|_| ApiError::invalid("invalid_credential_entry"))
+}
+
+async fn rotate_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+    Json(request): Json<RotateCredentialRequest>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .rotate(&credential_ref, &request.value)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn revoke_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .revoke(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn enable_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .enable(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+fn parse_optional_timestamp(value: Option<String>) -> Result<Option<UtcTimestamp>, ApiError> {
+    value
+        .map(UtcTimestamp::parse)
+        .transpose()
+        .map_err(|_| ApiError::invalid("invalid_expires_at"))
 }
 
 #[derive(Deserialize)]
@@ -2217,6 +2344,14 @@ mod tests {
             .expect("valid request")
     }
 
+    async fn body_text(response: axum::response::Response) -> String {
+        use axum::body::to_bytes;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("bounded response body");
+        String::from_utf8(bytes.to_vec()).expect("response body is UTF-8")
+    }
+
     #[tokio::test]
     async fn protected_routes_require_bearer_authentication_before_database_access() {
         let response = test_router(PathBuf::from("."))
@@ -2233,6 +2368,126 @@ mod tests {
             .await
             .expect("router response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn credential_admin_routes_are_authenticated_metadata_only_and_lifecycle_aware() {
+        const VALUE: &str = "ghp_do_not_leak_this_value";
+        let router = test_router(PathBuf::from("."));
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(request(Method::GET, "/v1/admin/credentials", "", false))
+            .await
+            .expect("router response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                &format!(
+                    r#"{{"credential_ref":"github.app","provider":"github","environment_variable":"GITHUB_PERSONAL_ACCESS_TOKEN","scope":"repos","owner":"control-admin","value":"{VALUE}"}}"#
+                ),
+                true,
+            ))
+            .await
+            .expect("create credential");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = body_text(created).await;
+        assert!(!created_body.contains(VALUE));
+        assert!(created_body.contains("\"credential_ref\":\"github.app\""));
+
+        let listed = router
+            .clone()
+            .oneshot(request(Method::GET, "/v1/admin/credentials", "", true))
+            .await
+            .expect("list credentials");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = body_text(listed).await;
+        assert!(listed_body.contains("\"github.app\""));
+        assert!(!listed_body.contains(VALUE));
+
+        let rotated = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/github.app/rotate",
+                r#"{"value":"rotated-secret"}"#,
+                true,
+            ))
+            .await
+            .expect("rotate credential");
+        assert_eq!(rotated.status(), StatusCode::OK);
+        assert!(!body_text(rotated).await.contains("rotated-secret"));
+
+        let revoked = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/github.app/revoke",
+                "",
+                true,
+            ))
+            .await
+            .expect("revoke credential");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(body_text(revoked).await.contains("disabled_at"));
+
+        let invalid = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                r#"{"credential_ref":"UPPER","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"x"}"#,
+                true,
+            ))
+            .await
+            .expect("invalid credential");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let missing = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/nope.app/rotate",
+                r#"{"value":"x"}"#,
+                true,
+            ))
+            .await
+            .expect("rotate missing credential");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn credential_admin_create_rejects_bad_timestamp_and_bad_value_length() {
+        let router = test_router(PathBuf::from("."));
+        let bad_timestamp = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                r#"{"credential_ref":"a.b","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"x","expires_at":"not-a-timestamp"}"#,
+                true,
+            ))
+            .await
+            .expect("bad timestamp response");
+        assert_eq!(bad_timestamp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let oversized = router
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                &format!(
+                    r#"{{"credential_ref":"a.b","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"{}"}}"#,
+                    "x".repeat(70 * 1024)
+                ),
+                true,
+            ))
+            .await
+            .expect("oversized value response");
+        assert_eq!(oversized.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

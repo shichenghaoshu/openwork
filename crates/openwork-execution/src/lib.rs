@@ -136,6 +136,12 @@ impl UtcTimestamp {
         self.0.unix_timestamp_nanos()
     }
 
+    /// Returns the canonical RFC 3339 UTC representation with a `Z` suffix.
+    #[must_use]
+    pub fn to_rfc3339_string(self) -> String {
+        self.canonical_string()
+    }
+
     fn canonical_string(self) -> String {
         self.0
             .format(&Rfc3339)

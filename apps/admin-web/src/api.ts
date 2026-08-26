@@ -1,5 +1,5 @@
 import type { OpenworkApi, BridgeResponse } from '../electron/preload'
-import type { Approval, Connector, ConnectorTool, Run, RuntimeInfo, WorkspaceApp, WorkspaceFile } from './types'
+import type { Approval, Connector, ConnectorTool, CredentialMetadata, Run, RuntimeInfo, WorkspaceApp, WorkspaceFile } from './types'
 
 declare global {
   interface Window { openwork: OpenworkApi }
@@ -91,4 +91,13 @@ export const api = {
   getSettings: async (): Promise<Record<string, unknown>> => unwrap(await window.openwork.getSettings()),
   updateSettings: async (default_runtime: string): Promise<Record<string, unknown>> =>
     unwrap(await window.openwork.updateSettings({ default_runtime })),
+  listCredentials: async (): Promise<CredentialMetadata[]> => unwrap<CredentialMetadata[]>(await window.openwork.listCredentials()),
+  createCredential: async (body: { credential_ref: string; provider: string; environment_variable: string; scope: string; owner: string; value: string; expires_at?: string }): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.createCredential(body)),
+  rotateCredential: async (id: string, value: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.rotateCredential(id, value)),
+  revokeCredential: async (id: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.revokeCredential(id)),
+  enableCredential: async (id: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.enableCredential(id)),
 }

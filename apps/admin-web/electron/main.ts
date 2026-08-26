@@ -29,6 +29,10 @@ function validId(id: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)
 }
 
+function validCredentialRef(id: string): boolean {
+  return /^[a-z][a-z0-9._-]{0,127}$/.test(id)
+}
+
 async function controlRequest(
   method: HttpMethod,
   endpoint: string,
@@ -163,6 +167,29 @@ function registerIpc(): void {
   ipcMain.handle('control:getSettings', () => controlRequest('GET', '/v1/admin/settings'))
   ipcMain.handle('control:updateSettings', (_event, body: { default_runtime: string }) =>
     controlRequest('POST', '/v1/admin/settings', body),
+  )
+  // Credential administration is metadata-only: the value is never read back
+  // and every renderer-visible response is redacted by the Control API.
+  ipcMain.handle('control:listCredentials', () => controlRequest('GET', '/v1/admin/credentials'))
+  ipcMain.handle('control:createCredential', (_event, body: { credential_ref: string; provider: string; environment_variable: string; scope: string; owner: string; value: string; expires_at?: string }) =>
+    validCredentialRef(body.credential_ref)
+      ? controlRequest('POST', '/v1/admin/credentials', body)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid credential reference.' }),
+  )
+  ipcMain.handle('control:rotateCredential', (_event, id: string, value: string) =>
+    validCredentialRef(id) && typeof value === 'string' && value.length > 0
+      ? controlRequest('POST', `/v1/admin/credentials/${encodeURIComponent(id)}/rotate`, { value })
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid credential reference.' }),
+  )
+  ipcMain.handle('control:revokeCredential', (_event, id: string) =>
+    validCredentialRef(id)
+      ? controlRequest('POST', `/v1/admin/credentials/${encodeURIComponent(id)}/revoke`)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid credential reference.' }),
+  )
+  ipcMain.handle('control:enableCredential', (_event, id: string) =>
+    validCredentialRef(id)
+      ? controlRequest('POST', `/v1/admin/credentials/${encodeURIComponent(id)}/enable`)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid credential reference.' }),
   )
 }
 

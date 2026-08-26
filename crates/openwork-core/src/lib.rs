@@ -1,5 +1,7 @@
 //! Shared result, error, event, and redaction primitives for `OpenWork`.
 
+pub mod crypto;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
