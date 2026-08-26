@@ -7,6 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chacha20poly1305.workspace = true
+rand = "0.10.2"
 serde.workspace = true
 serde_json.workspace = true
 

@@ -136,6 +136,12 @@ impl UtcTimestamp {
         self.0.unix_timestamp_nanos()
     }
 
+    /// Returns the canonical RFC 3339 UTC representation with a `Z` suffix.
+    #[must_use]
+    pub fn to_rfc3339_string(self) -> String {
+        self.canonical_string()
+    }
+
     fn canonical_string(self) -> String {
         self.0
             .format(&Rfc3339)
@@ -450,6 +456,10 @@ pub enum AuditEventType {
     ApprovalBindingMismatch,
     CancelRequested,
     CancelConfirmed,
+    PromptEnvelopeStored,
+    PromptEnvelopeConsumed,
+    PromptEnvelopeExpired,
+    PromptEnvelopeCorrupt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1838,6 +1848,10 @@ const fn audit_event_type_name(event_type: AuditEventType) -> &'static str {
         AuditEventType::ApprovalBindingMismatch => "approval_binding_mismatch",
         AuditEventType::CancelRequested => "cancel_requested",
         AuditEventType::CancelConfirmed => "cancel_confirmed",
+        AuditEventType::PromptEnvelopeStored => "prompt_envelope_stored",
+        AuditEventType::PromptEnvelopeConsumed => "prompt_envelope_consumed",
+        AuditEventType::PromptEnvelopeExpired => "prompt_envelope_expired",
+        AuditEventType::PromptEnvelopeCorrupt => "prompt_envelope_corrupt",
     }
 }
 

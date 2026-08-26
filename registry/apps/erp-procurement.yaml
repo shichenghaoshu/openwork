@@ -1,0 +1,66 @@
+apiVersion: openwork.io/v1
+kind: CapabilityPack
+metadata:
+  id: org.openwork.erp.procurement
+  name: ERP Procurement
+  version: 1.0.0
+  description: Read budgets, approved vendors, and catalog items; create governed purchase requests with exact manager approval.
+provider:
+  type: native
+  adapter: mock-erp
+capabilities:
+  - id: erp.budget.read
+    description: Reads the remaining budget for one department.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [department]
+      properties:
+        department: { type: string, minLength: 1, maxLength: 128 }
+  - id: erp.vendor.read
+    description: Searches approved vendors.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query: { type: string, minLength: 1, maxLength: 128 }
+  - id: erp.item.read
+    description: Searches the catalog for items.
+    risk: L0
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [query]
+      properties:
+        query: { type: string, minLength: 1, maxLength: 128 }
+  - id: erp.purchase_request.create
+    description: Creates one exact structured purchase request after L3 approval.
+    risk: L3
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [requester, department, cost_center, item_description, quantity, unit_estimate, currency, justification, delivery_location, requested_date]
+      properties:
+        requester: { type: string, minLength: 1, maxLength: 256 }
+        department: { type: string, minLength: 1, maxLength: 128 }
+        cost_center: { type: string, minLength: 1, maxLength: 128 }
+        item_description: { type: string, minLength: 1, maxLength: 1024 }
+        quantity: { type: integer, minimum: 1, maximum: 100000 }
+        unit_estimate: { type: number, exclusiveMinimum: 0, maximum: 1000000 }
+        currency: { type: string, enum: [CNY, USD, EUR] }
+        vendor: { type: string, minLength: 1, maxLength: 256 }
+        justification: { type: string, minLength: 1, maxLength: 4096 }
+        delivery_location: { type: string, minLength: 1, maxLength: 256 }
+        requested_date:
+          type: string
+          pattern: ^\d{4}-\d{2}-\d{2}$
+        budget_reference: { type: string, minLength: 1, maxLength: 256 }
+permissions:
+  filesystem:
+    read: [workspace]
+    write: [artifacts]
+  network: restricted
+  credentials: [erp.read]

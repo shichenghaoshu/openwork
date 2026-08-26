@@ -2110,6 +2110,10 @@ fn parse_audit_event_type(s: &str) -> Result<AuditEventType, OpenWorkError> {
         "approval_binding_mismatch" => Ok(AuditEventType::ApprovalBindingMismatch),
         "cancel_requested" => Ok(AuditEventType::CancelRequested),
         "cancel_confirmed" => Ok(AuditEventType::CancelConfirmed),
+        "prompt_envelope_stored" => Ok(AuditEventType::PromptEnvelopeStored),
+        "prompt_envelope_consumed" => Ok(AuditEventType::PromptEnvelopeConsumed),
+        "prompt_envelope_expired" => Ok(AuditEventType::PromptEnvelopeExpired),
+        "prompt_envelope_corrupt" => Ok(AuditEventType::PromptEnvelopeCorrupt),
         _ => Err(super::internal_error("unknown audit event type")),
     }
 }

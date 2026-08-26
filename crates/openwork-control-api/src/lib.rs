@@ -1,6 +1,13 @@
 //! Authenticated, Postgres-backed M1 control-plane HTTP API.
 
+/// Executed capability output plus optional generated artifact files.
+///
+/// The first element is the public output value; the second, when present, is
+/// a list of `(portable filename, bytes)` artifact files belonging to the run.
+type ClaimedExecutionWithArtifacts = (Value, Option<Vec<(String, Vec<u8>)>>);
+
 mod connector_runtime;
+pub mod erp;
 mod worker_runtime;
 
 use axum::{
@@ -15,11 +22,11 @@ use axum::{
 use openwork_apps::{
     AppId, AppProvider, AppRegistry, AvailableApp, CapabilityDescriptor, InstalledApp,
 };
-use openwork_core::ErrorCode;
+use openwork_core::{ErrorCode, redact_json};
 use openwork_execution::{
     ActionId, ActionRequest, ActorId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    ApprovalStatus, DEFAULT_MAX_ARTIFACT_BYTES, EXECUTION_SCHEMA_VERSION, Run, RunId, RunStatus,
-    Sha256Digest, UtcTimestamp,
+    ApprovalStatus, Artifact, DEFAULT_MAX_ARTIFACT_BYTES, EXECUTION_SCHEMA_VERSION,
+    RelativeArtifactPath, Run, RunId, RunStatus, Sha256Digest, UtcTimestamp,
     action_executor::{ActionExecutionReceipt, ClaimedAction},
     approval::ApprovalRepository,
     artifact::ArtifactScanner,
@@ -47,6 +54,16 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use connector_runtime::{CallError, ConnectorRegistry, LookupError};
+use erp::{ErpAdapter, ErpError, MockErpAdapter, PurchaseRequest};
+use openwork_apps::{CredentialMetadata, MemorySecretStore, SecretStore, SecretStoreEntry};
+use openwork_core::crypto::EnvironmentKeyProvider;
+use secret_store::PostgresSecretStore;
+
+mod prompt_envelope;
+pub mod secret_store;
+
+use openwork_core::crypto::KeyProvider;
+pub use prompt_envelope::DurablePromptDelivery;
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const PROMPT_DELIVERY_CAPACITY: usize = 128;
@@ -151,6 +168,8 @@ struct AppState {
     app_registry: Arc<AppRegistry>,
     installed_apps: Arc<Mutex<BTreeMap<String, InstalledApp>>>,
     admin_settings: Arc<Mutex<AdminSettings>>,
+    secret_store: Arc<dyn SecretStore>,
+    erp: Arc<dyn ErpAdapter>,
 }
 
 const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -176,6 +195,9 @@ struct RouterDependencies {
     worker_runtimes: BTreeSet<String>,
     worker_ready: Arc<AtomicBool>,
     connectors: Arc<ConnectorRegistry>,
+    secret_store: Arc<dyn SecretStore>,
+    app_registry: AppRegistry,
+    erp: Arc<dyn ErpAdapter>,
 }
 
 /// One-time, fail-closed prompt retrieval boundary for a durable worker.
@@ -184,12 +206,29 @@ struct RouterDependencies {
 /// process restart creates an empty implementation, so a worker must fail
 /// closed if its durable run has no matching prompt delivery entry.
 pub trait PromptDelivery: Send + Sync {
+    /// Publishes one prompt after its run is durably created, keyed by run ID
+    /// and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe-to-log error without retaining prompt bytes when the
+    /// backend is full, the digest does not match, the run is already
+    /// published, or the backing store is unavailable.
+    fn register_prompt(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError>;
+
     /// Takes one prompt only when its run ID and persisted digest both match.
     ///
     /// # Errors
     ///
     /// Returns an availability error for an expired, consumed, unknown, or
-    /// restarted entry; or a binding error when the digest does not match.
+    /// restarted entry; a binding error when the digest does not match; or a
+    /// corruption error when the stored envelope cannot be authenticated.
     fn take_prompt(
         &self,
         run_id: &RunId,
@@ -211,6 +250,7 @@ pub enum PromptDeliveryError {
     DuplicateRun,
     DigestMismatch,
     Unavailable,
+    Corrupt,
 }
 
 /// A consumed prompt whose backing bytes are cleared when dropped.
@@ -254,6 +294,14 @@ impl SecretBytes {
     fn into_vec(mut self) -> Vec<u8> {
         std::mem::take(&mut self.0)
     }
+
+    fn from_vec(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl Drop for SecretBytes {
@@ -287,23 +335,36 @@ pub struct InMemoryPromptDelivery {
 /// sleeps or retries. This remains process-local and does not survive restart.
 pub struct SharedPromptBoundary {
     creation_gate: Mutex<()>,
-    delivery: InMemoryPromptDelivery,
+    delivery: Box<dyn PromptDelivery>,
 }
 
 impl SharedPromptBoundary {
-    /// Builds a shared creation gate around a bounded prompt broker.
+    /// Builds a shared creation gate around a prompt broker.
     #[must_use]
-    pub fn new(delivery: InMemoryPromptDelivery) -> Self {
+    pub fn new(delivery: impl PromptDelivery + 'static) -> Self {
         Self {
             creation_gate: Mutex::new(()),
-            delivery,
+            delivery: Box::new(delivery),
         }
     }
 
-    /// Creates the production shared gate and bounded prompt broker.
+    /// Creates the production shared gate and process-local bounded broker.
+    ///
+    /// This is the local/test backend: restart loses undelivered prompts and
+    /// workers fail closed, exactly as before.
     #[must_use]
     pub fn production() -> Self {
         Self::new(InMemoryPromptDelivery::production())
+    }
+
+    /// Creates the durable encrypted envelope broker over Postgres.
+    #[must_use]
+    pub fn durable(
+        pool: PgPool,
+        keys: Arc<dyn KeyProvider>,
+        store: PostgresExecutionStore,
+    ) -> Self {
+        Self::new(DurablePromptDelivery::new(pool, keys, store))
     }
 
     /// Executes a worker claim-and-take closure only after publication is complete.
@@ -322,18 +383,18 @@ impl SharedPromptBoundary {
             .creation_gate
             .lock()
             .map_err(|_| PromptDeliveryError::Unavailable)?;
-        Ok(claim_and_take(&self.delivery))
+        Ok(claim_and_take(self.delivery.as_ref()))
     }
 
     fn with_creation_gate<T>(
         &self,
-        publish: impl FnOnce(&InMemoryPromptDelivery) -> T,
+        publish: impl FnOnce(&dyn PromptDelivery) -> T,
     ) -> Result<T, PromptDeliveryError> {
         let _gate = self
             .creation_gate
             .lock()
             .map_err(|_| PromptDeliveryError::Unavailable)?;
-        Ok(publish(&self.delivery))
+        Ok(publish(self.delivery.as_ref()))
     }
 }
 
@@ -348,6 +409,50 @@ impl InMemoryPromptDelivery {
         )
     }
 
+    /// Registers the raw prompt only after its run has been durably created.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe-to-log error without retaining prompt bytes on failure.
+    fn register_bounded(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError> {
+        if self.capacity == 0 || prompt.len() > self.max_bytes {
+            return Err(PromptDeliveryError::CapacityExceeded);
+        }
+        let actual: [u8; 32] = Sha256::digest(prompt).into();
+        let actual = Sha256Digest::parse(hex_digest(actual))
+            .expect("SHA-256 output is always a valid lowercase digest");
+        if !digest_matches(&actual, expected_sha256) {
+            return Err(PromptDeliveryError::DigestMismatch);
+        }
+        let expires_at = expiry(now, self.ttl).ok_or(PromptDeliveryError::Unavailable)?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| PromptDeliveryError::Unavailable)?;
+        purge_expired_locked(&mut entries, now);
+        if entries.contains_key(run_id) {
+            return Err(PromptDeliveryError::DuplicateRun);
+        }
+        if entries.len() >= self.capacity {
+            return Err(PromptDeliveryError::CapacityExceeded);
+        }
+        entries.insert(
+            run_id.clone(),
+            StoredPrompt {
+                digest: expected_sha256.clone(),
+                expires_at,
+                bytes: SecretBytes::from_vec(prompt.to_vec()),
+            },
+        );
+        Ok(())
+    }
+
     /// Creates a bounded handoff. This is public for worker injection and tests.
     #[must_use]
     pub fn new(capacity: usize, max_bytes: usize, ttl: Duration) -> Self {
@@ -358,53 +463,19 @@ impl InMemoryPromptDelivery {
             entries: Mutex::new(BTreeMap::new()),
         }
     }
-
-    /// Registers the raw prompt only after its run has been durably created.
-    ///
-    /// # Errors
-    ///
-    /// Returns a safe-to-log error without retaining prompt bytes on failure.
-    fn register_prompt(
-        &self,
-        run_id: RunId,
-        expected_sha256: Sha256Digest,
-        bytes: SecretBytes,
-        now: UtcTimestamp,
-    ) -> Result<(), PromptDeliveryError> {
-        if self.capacity == 0 || bytes.0.len() > self.max_bytes {
-            return Err(PromptDeliveryError::CapacityExceeded);
-        }
-        let actual: [u8; 32] = Sha256::digest(&bytes.0).into();
-        let actual = Sha256Digest::parse(hex_digest(actual))
-            .expect("SHA-256 output is always a valid lowercase digest");
-        if !digest_matches(&actual, &expected_sha256) {
-            return Err(PromptDeliveryError::DigestMismatch);
-        }
-        let expires_at = expiry(now, self.ttl).ok_or(PromptDeliveryError::Unavailable)?;
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| PromptDeliveryError::Unavailable)?;
-        purge_expired_locked(&mut entries, now);
-        if entries.contains_key(&run_id) {
-            return Err(PromptDeliveryError::DuplicateRun);
-        }
-        if entries.len() >= self.capacity {
-            return Err(PromptDeliveryError::CapacityExceeded);
-        }
-        entries.insert(
-            run_id,
-            StoredPrompt {
-                digest: expected_sha256,
-                expires_at,
-                bytes,
-            },
-        );
-        Ok(())
-    }
 }
 
 impl PromptDelivery for InMemoryPromptDelivery {
+    fn register_prompt(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError> {
+        self.register_bounded(run_id, expected_sha256, prompt, now)
+    }
+
     fn take_prompt(
         &self,
         run_id: &RunId,
@@ -472,6 +543,32 @@ fn hex_digest(bytes: [u8; 32]) -> String {
 
 fn digest_matches(left: &Sha256Digest, right: &Sha256Digest) -> bool {
     bool::from(left.as_str().as_bytes().ct_eq(right.as_str().as_bytes()))
+}
+
+/// Runs an owned database future from synchronous or Tokio-backed callers.
+/// Multi-thread runtimes can safely use `block_in_place`; a current-thread
+/// runtime delegates to a dedicated thread so its sole executor is not blocked.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || database_runtime().block_on(future))
+            .join()
+            .expect("database runtime thread panicked"),
+        Err(_) => database_runtime().block_on(future),
+    }
+}
+
+fn database_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("database runtime must initialize")
 }
 
 /// Boundary between HTTP cancellation intent and the durable execution worker.
@@ -553,8 +650,28 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let recovery_time = UtcTimestamp::now();
     store.recover_expired_leases(recovery_actor.clone(), recovery_time)?;
     store.recover_interrupted_runs(recovery_actor, recovery_time)?;
-    let prompts = Arc::new(SharedPromptBoundary::production());
-    let connectors = Arc::new(ConnectorRegistry::new(config.connectors));
+    let keys: Arc<dyn KeyProvider> = Arc::new(EnvironmentKeyProvider::new());
+    let prompts = if env::var("OPENWORK_PROMPT_DELIVERY").as_deref() == Ok("durable") {
+        // A missing envelope key is a startup configuration error so a
+        // deployment can never silently regress to process-local handoff.
+        keys.key("prompt-envelope-v1").map_err(|_| {
+            ConfigError(
+                "OPENWORK_PROMPT_DELIVERY=durable requires OPENWORK_CRYPTO_KEY_PROMPT_ENVELOPE_V1",
+            )
+        })?;
+        Arc::new(SharedPromptBoundary::durable(
+            pool.clone(),
+            Arc::clone(&keys),
+            store.clone(),
+        ))
+    } else {
+        Arc::new(SharedPromptBoundary::production())
+    };
+    let secret_store: Arc<dyn SecretStore> = Arc::new(PostgresSecretStore::new(pool.clone(), keys));
+    let connectors = Arc::new(ConnectorRegistry::with_secret_store(
+        config.connectors,
+        Arc::clone(&secret_store),
+    ));
     let worker = config
         .worker
         .map(|worker_config| {
@@ -589,6 +706,9 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 worker_runtimes,
                 worker_ready,
                 connectors,
+                secret_store,
+                app_registry: load_app_registry(),
+                erp: Arc::new(MockErpAdapter::new()),
             },
         ),
     )
@@ -636,6 +756,9 @@ pub fn router_with_prompt_boundary(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            secret_store: Arc::new(MemorySecretStore::new()),
+            app_registry: load_app_registry(),
+            erp: Arc::new(MockErpAdapter::new()),
         },
     )
 }
@@ -659,6 +782,9 @@ fn router_with_cancellation(
             worker_runtimes: BTreeSet::new(),
             worker_ready: Arc::new(AtomicBool::new(false)),
             connectors: Arc::new(ConnectorRegistry::empty()),
+            secret_store: Arc::new(MemorySecretStore::new()),
+            app_registry: load_app_registry(),
+            erp: Arc::new(MockErpAdapter::new()),
         },
     )
 }
@@ -681,9 +807,11 @@ fn router_with_dependencies(
         worker_runtimes: Arc::new(dependencies.worker_runtimes),
         worker_ready: dependencies.worker_ready,
         connectors: dependencies.connectors,
-        app_registry: Arc::new(load_app_registry()),
+        app_registry: Arc::new(dependencies.app_registry),
         installed_apps: Arc::new(Mutex::new(BTreeMap::new())),
         admin_settings: Arc::new(Mutex::new(AdminSettings::default())),
+        secret_store: dependencies.secret_store,
+        erp: dependencies.erp,
     });
     let protected = Router::new()
         .route("/runs", post(create_run))
@@ -691,6 +819,10 @@ fn router_with_dependencies(
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/events", get(list_events))
         .route("/runs/{id}/artifacts", get(list_artifacts))
+        .route(
+            "/runs/{id}/artifacts/{artifact_id}/content",
+            get(artifact_content),
+        )
         .route("/approvals", get(list_approvals))
         .route("/approvals/{id}", get(get_approval))
         .route("/approvals/{id}/approve", post(approve))
@@ -714,6 +846,14 @@ fn router_with_dependencies(
             "/admin/settings",
             get(get_admin_settings).post(update_admin_settings),
         )
+        .route(
+            "/admin/credentials",
+            get(list_credentials).post(create_credential),
+        )
+        .route("/admin/credentials/{ref}", get(get_credential))
+        .route("/admin/credentials/{ref}/rotate", post(rotate_credential))
+        .route("/admin/credentials/{ref}/revoke", post(revoke_credential))
+        .route("/admin/credentials/{ref}/enable", post(enable_credential))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -907,6 +1047,7 @@ struct CapabilityInvokeRequest {
     parameters: Value,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn invoke_capability(
     State(state): State<Arc<AppState>>,
     Path((id, capability)): Path<(String, String)>,
@@ -929,7 +1070,8 @@ async fn invoke_capability(
     let capability_id = descriptor.id.as_str().to_owned();
     let risk = descriptor.risk;
     let connector = match &descriptor.provider {
-        AppProvider::Mcp { connector } => connector.clone(),
+        AppProvider::Mcp { connector } => Some(connector.clone()),
+        AppProvider::Native { adapter } if adapter == "mock-erp" => None,
         _ => return Err(ApiError::unavailable("capability_dispatch_unavailable")),
     };
     {
@@ -946,10 +1088,16 @@ async fn invoke_capability(
         openwork_execution::RiskLevel::ExternalEffect
             | openwork_execution::RiskLevel::DestructiveOrFinancial
     ) {
-        if capability_id != "github.issue.create" || connector != "github" {
-            return Err(ApiError::unavailable("capability_dispatch_unavailable"));
+        let approval_kind = match (capability_id.as_str(), connector.as_deref()) {
+            ("github.issue.create", Some("github")) => "github",
+            ("erp.purchase_request.create", None) => "erp",
+            _ => return Err(ApiError::unavailable("capability_dispatch_unavailable")),
+        };
+        if approval_kind == "github" {
+            validate_github_issue_create(&request.parameters)?;
+        } else {
+            validate_erp_purchase_request(&request.parameters)?;
         }
-        validate_github_issue_create(&request.parameters)?;
         let actor = ActorId::parse(state.actor_id.clone()).map_err(|_| ApiError::internal())?;
         let approval = create_capability_approval(
             &state,
@@ -958,6 +1106,7 @@ async fn invoke_capability(
             &capability_id,
             request.resource,
             request.parameters,
+            approval_kind,
         )
         .await?;
         return Ok((
@@ -974,14 +1123,16 @@ async fn invoke_capability(
             })),
         ));
     }
-    if connector != "github" {
-        return Err(ApiError::unavailable("capability_dispatch_unavailable"));
-    }
-    let connectors = Arc::clone(&state.connectors);
-    let capability = capability_id.clone();
-    let parameters = request.parameters;
-    let output =
-        tokio::task::spawn_blocking(move || connectors.call_capability(&capability, &parameters))
+    // Read-only capabilities execute immediately. GitHub maps to a managed
+    // MCP connector; the mock ERP adapter answers budget/vendor/item reads.
+    match connector.as_deref() {
+        Some("github") => {
+            let connectors = Arc::clone(&state.connectors);
+            let capability = capability_id.clone();
+            let parameters = request.parameters;
+            let output = tokio::task::spawn_blocking(move || {
+                connectors.call_capability(&capability, &parameters)
+            })
             .await
             .map_err(|_| ApiError::internal())?
             .map_err(|error| match error {
@@ -990,12 +1141,157 @@ async fn invoke_capability(
                 CallError::NotConfigured => ApiError::unavailable("connector_not_configured"),
                 CallError::Unavailable => ApiError::unavailable("connector_unavailable"),
             })?;
-    Ok((
-        StatusCode::OK,
-        Json(
-            json!({"status":"completed", "app_id":app_id, "capability":capability_id, "output":output}),
-        ),
-    ))
+            Ok((
+                StatusCode::OK,
+                Json(
+                    json!({"status":"completed", "app_id":app_id, "capability":capability_id, "output":output}),
+                ),
+            ))
+        }
+        None => {
+            let output = erp_read_call(state.erp.as_ref(), &capability_id, &request.parameters)?;
+            Ok((
+                StatusCode::OK,
+                Json(
+                    json!({"status":"completed", "app_id":app_id, "capability":capability_id, "output":output}),
+                ),
+            ))
+        }
+        _ => Err(ApiError::unavailable("capability_dispatch_unavailable")),
+    }
+}
+
+/// Executes one read-only mock ERP capability immediately and returns its
+/// bounded output. Reads never touch approval or claim state.
+fn erp_read_call(
+    erp: &dyn ErpAdapter,
+    capability_id: &str,
+    parameters: &Value,
+) -> Result<Value, ApiError> {
+    let output = match capability_id {
+        "erp.budget.read" => {
+            let department = required_string_parameter(parameters, "department")?;
+            erp.budget(department)
+                .map(|value| serde_json::to_value(value).expect("budget value serializes"))
+                .map_err(erp_call_error)?
+        }
+        "erp.vendor.read" => {
+            let query = required_string_parameter(parameters, "query")?;
+            erp.vendors(query)
+                .map(|value| serde_json::to_value(value).expect("vendor list serializes"))
+                .map_err(erp_call_error)?
+        }
+        "erp.item.read" => {
+            let query = required_string_parameter(parameters, "query")?;
+            erp.items(query)
+                .map(|value| serde_json::to_value(value).expect("item list serializes"))
+                .map_err(erp_call_error)?
+        }
+        _ => return Err(ApiError::not_found("capability_not_mapped")),
+    };
+    Ok(output)
+}
+
+fn erp_call_error(error: ErpError) -> ApiError {
+    match error {
+        ErpError::InvalidRequest => ApiError::invalid("invalid_capability_parameters"),
+        ErpError::BudgetInsufficient | ErpError::UnknownVendor | ErpError::WriteFailed => {
+            ApiError::unavailable("erp_unavailable")
+        }
+    }
+}
+
+/// Rejects unknown keys and enforces the exact structured procurement fields.
+fn validate_erp_purchase_request(parameters: &Value) -> Result<(), ApiError> {
+    const KEYS: [&str; 12] = [
+        "requester",
+        "department",
+        "cost_center",
+        "item_description",
+        "quantity",
+        "unit_estimate",
+        "currency",
+        "vendor",
+        "justification",
+        "delivery_location",
+        "requested_date",
+        "budget_reference",
+    ];
+    let object = parameters
+        .as_object()
+        .ok_or(ApiError::invalid("invalid_capability_parameters"))?;
+    if object.keys().any(|key| !KEYS.contains(&key.as_str()))
+        || ![
+            "requester",
+            "department",
+            "cost_center",
+            "item_description",
+            "quantity",
+            "unit_estimate",
+            "currency",
+            "justification",
+            "delivery_location",
+            "requested_date",
+        ]
+        .iter()
+        .all(|key| {
+            object.get(*key).is_some_and(|value| {
+                !(value.is_null() || value.is_string() && value.as_str().is_some_and(str::is_empty))
+            })
+        })
+        || object
+            .get("quantity")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0 || value > 100_000)
+        || object
+            .get("unit_estimate")
+            .and_then(Value::as_f64)
+            .is_none_or(|value| !value.is_finite() || value <= 0.0 || value > 1_000_000.0)
+        || object
+            .get("currency")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !matches!(value, "CNY" | "USD" | "EUR"))
+        || object
+            .get("requested_date")
+            .and_then(Value::as_str)
+            .is_none_or(|value| {
+                value.len() != 10
+                    || !value.bytes().enumerate().all(|(index, byte)| {
+                        if index == 4 || index == 7 {
+                            byte == b'-'
+                        } else {
+                            byte.is_ascii_digit()
+                        }
+                    })
+            })
+        || [
+            "requester",
+            "department",
+            "cost_center",
+            "item_description",
+            "vendor",
+            "justification",
+            "delivery_location",
+            "budget_reference",
+        ]
+        .iter()
+        .any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() > 4096)
+        })
+    {
+        return Err(ApiError::invalid("invalid_capability_parameters"));
+    }
+    Ok(())
+}
+
+fn required_string_parameter<'a>(parameters: &'a Value, key: &str) -> Result<&'a str, ApiError> {
+    parameters
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(ApiError::invalid("invalid_capability_parameters"))
 }
 
 fn validate_capability_parameters(
@@ -1052,6 +1348,7 @@ async fn create_capability_approval(
     capability_id: &str,
     resource: String,
     parameters: Value,
+    dispatch_kind: &str,
 ) -> Result<ApprovalRequest, ApiError> {
     let scanner =
         ArtifactScanner::new(DEFAULT_MAX_ARTIFACT_BYTES).map_err(|_| ApiError::internal())?;
@@ -1059,7 +1356,7 @@ async fn create_capability_approval(
     let created_at = UtcTimestamp::now();
     let run = orchestrator
         .create_run(
-            "capability:github",
+            &format!("capability:{dispatch_kind}"),
             &state.workspace_root,
             actor.clone(),
             "governed capability invocation",
@@ -1281,6 +1578,109 @@ async fn update_admin_settings(
     Ok(Json(settings.clone()))
 }
 
+/// Admin credential operations. Responses carry metadata only; a raw value
+/// never leaves the [`SecretStore`] boundary and is never serialized here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCredentialRequest {
+    credential_ref: String,
+    provider: String,
+    environment_variable: String,
+    scope: String,
+    owner: String,
+    value: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateCredentialRequest {
+    value: String,
+}
+
+async fn list_credentials(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<CredentialMetadata>>, ApiError> {
+    state
+        .secret_store
+        .list()
+        .map(Json)
+        .map_err(|_| ApiError::internal())
+}
+
+async fn get_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .metadata(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn create_credential(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateCredentialRequest>,
+) -> Result<(StatusCode, Json<CredentialMetadata>), ApiError> {
+    let entry = SecretStoreEntry {
+        credential_ref: request.credential_ref,
+        provider: request.provider,
+        environment_variable: request.environment_variable,
+        scope: request.scope,
+        owner: request.owner,
+        value: request.value,
+        expires_at: parse_optional_timestamp(request.expires_at)?,
+    };
+    state
+        .secret_store
+        .store(entry)
+        .map(|metadata| (StatusCode::CREATED, Json(metadata)))
+        .map_err(|_| ApiError::invalid("invalid_credential_entry"))
+}
+
+async fn rotate_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+    Json(request): Json<RotateCredentialRequest>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .rotate(&credential_ref, &request.value)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn revoke_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .revoke(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+async fn enable_credential(
+    State(state): State<Arc<AppState>>,
+    Path(credential_ref): Path<String>,
+) -> Result<Json<CredentialMetadata>, ApiError> {
+    state
+        .secret_store
+        .enable(&credential_ref)
+        .map(Json)
+        .map_err(|_| ApiError::not_found("credential_not_found"))
+}
+
+fn parse_optional_timestamp(value: Option<String>) -> Result<Option<UtcTimestamp>, ApiError> {
+    value
+        .map(UtcTimestamp::parse)
+        .transpose()
+        .map_err(|_| ApiError::invalid("invalid_expires_at"))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRun {
@@ -1336,9 +1736,9 @@ async fn create_run(
                 .map_err(|_| ApiError::internal())?;
             if delivery
                 .register_prompt(
-                    run.id.clone(),
-                    run.prompt_sha256.clone(),
-                    prompt,
+                    &run.id,
+                    &run.prompt_sha256,
+                    prompt.as_bytes(),
                     UtcTimestamp::now(),
                 )
                 .is_err()
@@ -1516,7 +1916,7 @@ async fn cancel_run(
 async fn list_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<openwork_execution::Artifact>>, ApiError> {
+) -> Result<Json<Vec<Artifact>>, ApiError> {
     let id = validate_execution_id(id)?;
     let run_id =
         RunId::parse(&id.to_string()).map_err(|_| ApiError::invalid("invalid_execution_id"))?;
@@ -1559,18 +1959,36 @@ struct ApprovalResponse {
     decision: Option<Value>,
     #[serde(with = "time::serde::rfc3339::option")]
     consumed_at: Option<OffsetDateTime>,
+    /// Reviewed capability id and its exact-bound parameters, redacted before
+    /// they reach the renderer. Parameters never include credential material.
+    capability: Option<String>,
+    parameters: Option<Value>,
+}
+
+/// Redacts every value in an approval's parameter object before serialization.
+/// The redaction keeps the values readable by the workspace renderer while
+/// replacing any known secret-bearing keys.
+fn redact_approval_value(value: &Value) -> Value {
+    redact_json(value)
 }
 
 async fn list_approvals(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ApprovalResponse>>, ApiError> {
-    let rows = sqlx::query_as::<_, ApprovalResponse>(concat!(
-        "SELECT 1 AS schema_version,ar.id,run_id,action_id,parameter_hash::text,requested_by,request_reason,created_at,",
-        "expires_at,status::text AS status,revision,CASE WHEN ad.id IS NULL THEN NULL ELSE jsonb_build_object(",
+    let mut rows = sqlx::query_as::<_, ApprovalResponse>(concat!(
+        "SELECT 1 AS schema_version,ar.id,ar.run_id,ar.action_id,ar.parameter_hash::text,ar.requested_by,ar.request_reason,ar.created_at,",
+        "ar.expires_at,ar.status::text AS status,ar.revision,CASE WHEN ad.id IS NULL THEN NULL ELSE jsonb_build_object(",
         "'decision',ad.decision,'actor',ad.actor_id,'reason',ad.reason,'decided_at',to_char(ad.decided_at AT TIME ZONE 'UTC',",
-        "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')) END AS decision,consumed_at FROM approval_requests ar ",
-        "LEFT JOIN approval_decisions ad ON ad.approval_id=ar.id ORDER BY created_at"
+        "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')) END AS decision,ar.consumed_at,ca.capability_id AS capability,",
+        "ca.parameters FROM approval_requests ar ",
+        "LEFT JOIN approval_decisions ad ON ad.approval_id=ar.id ",
+        "LEFT JOIN capability_actions ca ON ca.approval_id=ar.id ORDER BY created_at"
     )).fetch_all(&state.pool).await?;
+    for row in &mut rows {
+        if let Some(parameters) = &mut row.parameters {
+            *parameters = redact_approval_value(&std::mem::take(parameters));
+        }
+    }
     Ok(Json(rows))
 }
 
@@ -1711,18 +2129,38 @@ async fn execute_approved_capability(
     let prepared = prepare_capability_execution(&state, id, expected_revision, actor.0).await?;
     reserve_capability_execution(&state.pool, &prepared.row).await?;
     let connectors = Arc::clone(&state.connectors);
+    let erp = Arc::clone(&state.erp);
     let action_uuid = prepared.row.action_id;
     let run_id = prepared.run_id.clone();
     let trusted_actor = prepared.actor.clone();
-    let Ok(Ok(output)) = tokio::task::spawn_blocking(move || {
-        connector_runtime::execute_claimed_github_capability(&connectors, prepared.claimed)
-    })
-    .await
+    let Ok(Ok((output, artifacts))) =
+        tokio::task::spawn_blocking(move || match prepared.claimed.action().action.as_str() {
+            "github.issue.create" => {
+                connector_runtime::execute_claimed_github_capability(&connectors, prepared.claimed)
+                    .map(|value| (value, None))
+            }
+            "erp.purchase_request.create" => {
+                execute_claimed_erp_capability(erp.as_ref(), prepared.claimed)
+            }
+            _ => Err(CallError::CapabilityNotMapped),
+        })
+        .await
     else {
         mark_capability_execution_uncertain(&state.pool, action_uuid).await;
         fail_capability_run(&state.store, &run_id, &trusted_actor);
         return Err(ApiError::unavailable("connector_execution_uncertain"));
     };
+    if let Some(files) = artifacts {
+        let scanned = write_and_scan_artifacts(&state, &run_id, files)?;
+        state
+            .store
+            .record_artifacts(
+                &run_id,
+                scanned,
+                AuditAppend::new(trusted_actor.clone(), UtcTimestamp::now()),
+            )
+            .map_err(|_| ApiError::internal())?;
+    }
     finalize_capability_execution(
         &state,
         action_uuid,
@@ -1732,6 +2170,190 @@ async fn execute_approved_capability(
         output,
     )
     .await
+}
+
+/// Executes one claimed mock-ERP purchase-request creation. The claim is
+/// already verified, single-use, and bound to the exact parameters; the exact
+/// request is converted back from the bound parameters and the adapter never
+/// sees anything else.
+#[allow(clippy::needless_pass_by_value)] // the claimed action is owned here and dropped
+fn execute_claimed_erp_capability(
+    erp: &dyn ErpAdapter,
+    claimed: ClaimedAction,
+) -> Result<ClaimedExecutionWithArtifacts, CallError> {
+    let action = claimed.action();
+    if action.action != "erp.purchase_request.create" {
+        return Err(CallError::CapabilityNotMapped);
+    }
+    let request: PurchaseRequest = serde_json::from_value(action.parameters.clone())
+        .map_err(|_| CallError::InvalidParameters)?;
+    let receipt = erp
+        .create_purchase_request(&request)
+        .map_err(|error| match error {
+            ErpError::InvalidRequest => CallError::InvalidParameters,
+            _ => CallError::Unavailable,
+        })?;
+    let files = purchase_request_artifacts(&request, &receipt);
+    Ok((
+        serde_json::to_value(&receipt).expect("ERP receipt always serializes"),
+        Some(files),
+    ))
+}
+
+/// Generates the human-readable Markdown request and the XLSX spreadsheet.
+/// Filenames are portable and carry the stable ERP request ID.
+fn purchase_request_artifacts(
+    request: &PurchaseRequest,
+    receipt: &erp::PurchaseRequestReceipt,
+) -> Vec<(String, Vec<u8>)> {
+    let markdown = format!(
+        "# Purchase request {id}\n\n- **Status**: {status}\n- **Estimated total**: {total:.2} {currency}\n- **ERP reference**: {id}\n- **Requester**: {requester}\n- **Department**: {department} ({cost_center})\n- **Item**: {item_description}\n- **Quantity**: {quantity}\n- **Unit estimate**: {unit:.2} {currency}\n- **Vendor**: {vendor}\n- **Justification**: {justification}\n- **Delivery location**: {delivery_location}\n- **Requested date**: {requested_date}\n- **Budget reference**: {budget_reference}\n- **Created at**: {created_at}\n",
+        id = receipt.erp_request_id,
+        status = receipt.status,
+        total = receipt.estimated_total,
+        currency = receipt.currency,
+        requester = request.requester,
+        department = request.department,
+        cost_center = request.cost_center,
+        item_description = request.item_description,
+        quantity = request.quantity,
+        unit = request.unit_estimate,
+        vendor = request.vendor.as_deref().unwrap_or("(open bid)"),
+        justification = request.justification,
+        delivery_location = request.delivery_location,
+        requested_date = request.requested_date,
+        budget_reference = request.budget_reference.as_deref().unwrap_or("(none)"),
+        created_at = receipt.created_at,
+    );
+    let spreadsheet = build_purchase_spreadsheet(request, receipt).unwrap_or_default();
+    vec![
+        (
+            format!("purchase-request-{}.md", receipt.erp_request_id),
+            markdown.into_bytes(),
+        ),
+        (
+            format!("purchase-request-{}.xlsx", receipt.erp_request_id),
+            spreadsheet,
+        ),
+    ]
+}
+
+fn build_purchase_spreadsheet(
+    request: &PurchaseRequest,
+    receipt: &erp::PurchaseRequestReceipt,
+) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("PurchaseRequest")?;
+    let rows: [(String, String); 13] = [
+        ("ERP reference".to_owned(), receipt.erp_request_id.clone()),
+        ("Status".to_owned(), receipt.status.clone()),
+        ("Requester".to_owned(), request.requester.clone()),
+        ("Department".to_owned(), request.department.clone()),
+        ("Cost center".to_owned(), request.cost_center.clone()),
+        (
+            "Item description".to_owned(),
+            request.item_description.clone(),
+        ),
+        ("Quantity".to_owned(), request.quantity.to_string()),
+        (
+            "Unit estimate".to_owned(),
+            format!("{:.2}", request.unit_estimate),
+        ),
+        (
+            "Estimated total".to_owned(),
+            format!("{:.2}", receipt.estimated_total),
+        ),
+        ("Currency".to_owned(), request.currency.clone()),
+        (
+            "Vendor".to_owned(),
+            request
+                .vendor
+                .clone()
+                .unwrap_or_else(|| "(open bid)".to_owned()),
+        ),
+        (
+            "Delivery location".to_owned(),
+            request.delivery_location.clone(),
+        ),
+        ("Requested date".to_owned(), request.requested_date.clone()),
+    ];
+    for (row, (label, value)) in rows.into_iter().enumerate() {
+        let label_format = rust_xlsxwriter::Format::new().set_bold();
+        let row = u32::try_from(row).expect("13 spreadsheet rows always fit in u32");
+        sheet.write_string_with_format(row, 0, &label, &label_format)?;
+        sheet.write_string(row, 1, &value)?;
+    }
+    workbook.save_to_buffer()
+}
+
+/// Writes artifact files under the run's artifact directory and returns the
+/// scanner-verified records. Files live under
+/// `<workspace>/.openwork/artifacts/<run_id>/<name>` so content previews can
+/// resolve them exactly without trusting client paths.
+fn write_and_scan_artifacts(
+    state: &AppState,
+    run_id: &RunId,
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<Artifact>, ApiError> {
+    let scanner =
+        ArtifactScanner::new(DEFAULT_MAX_ARTIFACT_BYTES).map_err(|_| ApiError::internal())?;
+    let run_root = state
+        .workspace_root
+        .join(".openwork")
+        .join("artifacts")
+        .join(run_id.to_string());
+    fs::create_dir_all(&run_root).map_err(|_| ApiError::internal())?;
+    let mut reported = Vec::with_capacity(files.len());
+    for (name, bytes) in files {
+        let relative =
+            RelativeArtifactPath::parse(name.clone()).map_err(|_| ApiError::internal())?;
+        if fs::write(run_root.join(&name), bytes).is_err() {
+            return Err(ApiError::internal());
+        }
+        reported.push(relative);
+    }
+    scanner
+        .scan(run_id, &run_root, &reported, UtcTimestamp::now())
+        .map_err(|_| ApiError::internal())
+}
+
+/// Resolves and returns the stored bytes of one artifact for preview.
+///
+/// Only text media types are served: binary artifacts remain metadata-only to
+/// the renderer and are never proxied through this endpoint.
+async fn artifact_content(
+    State(state): State<Arc<AppState>>,
+    Path((run_id, artifact_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let run_id =
+        RunId::parse(&run_id.to_string()).map_err(|_| ApiError::invalid("invalid_run_id"))?;
+    let artifact_id = artifact_id.to_string();
+    let artifacts = state
+        .store
+        .artifacts(&run_id)
+        .map_err(|_| ApiError::internal())?;
+    let artifact = artifacts
+        .into_iter()
+        .find(|item| item.id.to_hyphenated() == artifact_id)
+        .ok_or(ApiError::not_found("artifact_not_found"))?;
+    if !artifact.media_type.starts_with("text/") {
+        return Err(ApiError::unavailable("artifact_content_unavailable"));
+    }
+    let scanner =
+        ArtifactScanner::new(DEFAULT_MAX_ARTIFACT_BYTES).map_err(|_| ApiError::internal())?;
+    let run_root = state
+        .workspace_root
+        .join(".openwork")
+        .join("artifacts")
+        .join(run_id.to_string());
+    scanner
+        .verify(&run_root, &artifact)
+        .map_err(|_| ApiError::internal())?;
+    let path = run_root.join(artifact.path.as_str());
+    let bytes = fs::read(&path).map_err(|_| ApiError::internal())?;
+    let media_type = artifact.media_type;
+    Ok(([(axum::http::header::CONTENT_TYPE, media_type)], bytes))
 }
 
 async fn prepare_capability_execution(
@@ -1748,8 +2370,10 @@ async fn prepare_capability_execution(
     .fetch_optional(&state.pool)
     .await?
     .ok_or(ApiError::not_found("capability_action_not_found"))?;
-    if row.capability_id != "github.issue.create" {
-        return Err(ApiError::conflict("capability_action_not_executable"));
+    match row.capability_id.as_str() {
+        "github.issue.create" => validate_github_issue_create(&row.parameters)?,
+        "erp.purchase_request.create" => validate_erp_purchase_request(&row.parameters)?,
+        _ => return Err(ApiError::conflict("capability_action_not_executable")),
     }
     let enabled = state
         .installed_apps
@@ -1760,7 +2384,6 @@ async fn prepare_capability_execution(
     if !enabled {
         return Err(ApiError::conflict("app_not_enabled"));
     }
-    validate_github_issue_create(&row.parameters)?;
     let action_id =
         ActionId::parse(&row.action_id.to_string()).map_err(|_| ApiError::internal())?;
     let run_id = RunId::parse(&row.run_id.to_string()).map_err(|_| ApiError::internal())?;
@@ -2006,12 +2629,7 @@ mod tests {
         let now = timestamp("2026-08-22T00:00:00Z");
 
         delivery
-            .register_prompt(
-                run_id.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            )
+            .register_prompt(&run_id, &expected, prompt.as_bytes(), now)
             .expect("register prompt");
         assert!(matches!(
             delivery.take_prompt(&run_id, &wrong, now),
@@ -2039,29 +2657,14 @@ mod tests {
         let delivery = InMemoryPromptDelivery::new(1, 16, Duration::from_secs(1));
 
         delivery
-            .register_prompt(
-                first.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            )
+            .register_prompt(&first, &expected, prompt.as_bytes(), now)
             .expect("first prompt fits");
         assert_eq!(
-            delivery.register_prompt(
-                first.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&first, &expected, prompt.as_bytes(), now),
             Err(PromptDeliveryError::DuplicateRun)
         );
         assert_eq!(
-            delivery.register_prompt(
-                second,
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&second, &expected, prompt.as_bytes(), now),
             Err(PromptDeliveryError::CapacityExceeded)
         );
         let expired = timestamp("2026-08-22T00:00:02Z");
@@ -2084,12 +2687,7 @@ mod tests {
         let delivery = InMemoryPromptDelivery::new(1, 16, Duration::from_mins(1));
         let tampered = RunId::generate();
         assert_eq!(
-            delivery.register_prompt(
-                tampered.clone(),
-                digest("expected"),
-                SecretBytes::from_string("actual".to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&tampered, &digest("expected"), b"actual", now),
             Err(PromptDeliveryError::DigestMismatch)
         );
         assert!(matches!(
@@ -2099,11 +2697,9 @@ mod tests {
         let oversized = RunId::generate();
         assert_eq!(
             delivery.register_prompt(
-                oversized,
-                digest("this value is larger than the bounded prompt slot"),
-                SecretBytes::from_string(
-                    "this value is larger than the bounded prompt slot".to_owned(),
-                ),
+                &oversized,
+                &digest("this value is larger than the bounded prompt slot"),
+                "this value is larger than the bounded prompt slot".as_bytes(),
                 now,
             ),
             Err(PromptDeliveryError::CapacityExceeded)
@@ -2132,12 +2728,7 @@ mod tests {
                     creation_entered_tx.send(()).expect("signal gate held");
                     allow_publish_rx.recv().expect("allow publication");
                     delivery
-                        .register_prompt(
-                            publish_run_id,
-                            publish_digest,
-                            SecretBytes::from_string(prompt.to_owned()),
-                            now,
-                        )
+                        .register_prompt(&publish_run_id, &publish_digest, prompt.as_bytes(), now)
                         .expect("publish prompt before gate release");
                 })
                 .expect("creation gate is healthy");
@@ -2217,6 +2808,14 @@ mod tests {
             .expect("valid request")
     }
 
+    async fn body_text(response: axum::response::Response) -> String {
+        use axum::body::to_bytes;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("bounded response body");
+        String::from_utf8(bytes.to_vec()).expect("response body is UTF-8")
+    }
+
     #[tokio::test]
     async fn protected_routes_require_bearer_authentication_before_database_access() {
         let response = test_router(PathBuf::from("."))
@@ -2233,6 +2832,126 @@ mod tests {
             .await
             .expect("router response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn credential_admin_routes_are_authenticated_metadata_only_and_lifecycle_aware() {
+        const VALUE: &str = "ghp_do_not_leak_this_value";
+        let router = test_router(PathBuf::from("."));
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(request(Method::GET, "/v1/admin/credentials", "", false))
+            .await
+            .expect("router response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let created = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                &format!(
+                    r#"{{"credential_ref":"github.app","provider":"github","environment_variable":"GITHUB_PERSONAL_ACCESS_TOKEN","scope":"repos","owner":"control-admin","value":"{VALUE}"}}"#
+                ),
+                true,
+            ))
+            .await
+            .expect("create credential");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = body_text(created).await;
+        assert!(!created_body.contains(VALUE));
+        assert!(created_body.contains("\"credential_ref\":\"github.app\""));
+
+        let listed = router
+            .clone()
+            .oneshot(request(Method::GET, "/v1/admin/credentials", "", true))
+            .await
+            .expect("list credentials");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = body_text(listed).await;
+        assert!(listed_body.contains("\"github.app\""));
+        assert!(!listed_body.contains(VALUE));
+
+        let rotated = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/github.app/rotate",
+                r#"{"value":"rotated-secret"}"#,
+                true,
+            ))
+            .await
+            .expect("rotate credential");
+        assert_eq!(rotated.status(), StatusCode::OK);
+        assert!(!body_text(rotated).await.contains("rotated-secret"));
+
+        let revoked = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/github.app/revoke",
+                "",
+                true,
+            ))
+            .await
+            .expect("revoke credential");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(body_text(revoked).await.contains("disabled_at"));
+
+        let invalid = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                r#"{"credential_ref":"UPPER","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"x"}"#,
+                true,
+            ))
+            .await
+            .expect("invalid credential");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let missing = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials/nope.app/rotate",
+                r#"{"value":"x"}"#,
+                true,
+            ))
+            .await
+            .expect("rotate missing credential");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn credential_admin_create_rejects_bad_timestamp_and_bad_value_length() {
+        let router = test_router(PathBuf::from("."));
+        let bad_timestamp = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                r#"{"credential_ref":"a.b","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"x","expires_at":"not-a-timestamp"}"#,
+                true,
+            ))
+            .await
+            .expect("bad timestamp response");
+        assert_eq!(bad_timestamp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let oversized = router
+            .oneshot(request(
+                Method::POST,
+                "/v1/admin/credentials",
+                &format!(
+                    r#"{{"credential_ref":"a.b","provider":"github","environment_variable":"TOKEN","scope":"ro","owner":"admin","value":"{}"}}"#,
+                    "x".repeat(70 * 1024)
+                ),
+                true,
+            ))
+            .await
+            .expect("oversized value response");
+        assert_eq!(oversized.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -2332,5 +3051,401 @@ mod tests {
         assert!(resolve_workspace(&canonical_root, "missing").is_err());
 
         fs::remove_dir_all(&root).expect("remove workspace fixture");
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-Postgres procurement flow. Gated identically to the execution
+    // crate's Postgres tests: OPENWORK_TEST_DATABASE_URL on loopback with
+    // database openwork_test plus OPENWORK_TEST_DATABASE_RESET=1.
+    // -----------------------------------------------------------------------
+
+    const PURCHASE_PARAMETERS: &str = r#"{
+        "requester": "li.wei@example.invalid",
+        "department": "shanghai-office",
+        "cost_center": "SH-1001",
+        "item_description": "27-inch IPS office monitor",
+        "quantity": 20,
+        "unit_estimate": 1850,
+        "currency": "CNY",
+        "vendor": "Shanghai Display Supply",
+        "justification": "Bring the Shanghai office to dual-monitor workspaces.",
+        "delivery_location": "Shanghai, Zhangjiang Rd 88",
+        "requested_date": "2026-09-15",
+        "budget_reference": "BUDGET-FY2026-SH-OFFICE"
+    }"#;
+
+    async fn procurement_database() -> Option<PgPool> {
+        let Ok(database_url) = env::var("OPENWORK_TEST_DATABASE_URL") else {
+            eprintln!("skipping real Postgres test: OPENWORK_TEST_DATABASE_URL is not set");
+            return None;
+        };
+        assert_eq!(
+            env::var("OPENWORK_TEST_DATABASE_RESET").as_deref(),
+            Ok("1"),
+            "set OPENWORK_TEST_DATABASE_RESET=1 for the dedicated disposable test database"
+        );
+        assert!(
+            (database_url.contains("@127.0.0.1:") || database_url.contains("@localhost:"))
+                && database_url
+                    .split_once('?')
+                    .map_or(database_url.as_str(), |(base, _)| base)
+                    .ends_with("/openwork_test"),
+            "procurement tests require a loopback database named openwork_test"
+        );
+        async {
+            let pool = PgPoolOptions::new()
+                .max_connections(6)
+                .connect(&database_url)
+                .await
+                .map_err(|error| error.to_string())?;
+            MIGRATIONS
+                .run(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("TRUNCATE TABLE runs CASCADE")
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(pool)
+        }
+        .await
+        .ok()
+    }
+
+    fn procurement_registry() -> (tempfile::TempDir, AppRegistry) {
+        let directory = tempfile::tempdir().expect("registry directory");
+        fs::write(
+            directory.path().join("erp-procurement.yaml"),
+            include_str!("../../../registry/apps/erp-procurement.yaml"),
+        )
+        .expect("write procurement pack");
+        let registry = AppRegistry::load(directory.path()).expect("load procurement pack");
+        (directory, registry)
+    }
+
+    fn procurement_router(pool: PgPool, registry: AppRegistry) -> (Router, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("workspace root");
+        fs::create_dir_all(root.path().join(".openwork")).expect("control workspace directory");
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical workspace root");
+        (
+            router_with_dependencies(
+                pool,
+                TOKEN,
+                "test:control".to_owned(),
+                canonical_root,
+                RouterDependencies {
+                    cancellation: Arc::new(DurableCancellationCoordinator {
+                        store: PostgresExecutionStore::new(
+                            PgPoolOptions::new()
+                                .connect_lazy("postgres://openwork:openwork@127.0.0.1:9/openwork")
+                                .expect("unused lazy pool"),
+                        ),
+                    }),
+                    prompts: Arc::new(SharedPromptBoundary::production()),
+                    worker_runtimes: BTreeSet::new(),
+                    worker_ready: Arc::new(AtomicBool::new(false)),
+                    connectors: Arc::new(ConnectorRegistry::empty()),
+                    secret_store: Arc::new(MemorySecretStore::new()),
+                    app_registry: registry,
+                    erp: Arc::new(MockErpAdapter::new()),
+                },
+            ),
+            root,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
+    async fn procurement_flow_governs_exact_approval_and_generates_artifacts() {
+        let Some(pool) = procurement_database().await else {
+            return;
+        };
+        let (_registry_dir, registry) = procurement_registry();
+        let (router, _workspace_root) = procurement_router(pool.clone(), registry);
+
+        let installed = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/apps/org.openwork.erp.procurement/install",
+                "",
+                true,
+            ))
+            .await
+            .expect("install response");
+        assert_eq!(installed.status(), StatusCode::OK);
+
+        // 1. The employee request is an external effect: it must enter
+        //    AwaitingApproval with exact parameter binding instead of writing.
+        let invoked = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/apps/org.openwork.erp.procurement/capabilities/erp.purchase_request.create/invoke",
+                &format!(
+                    r#"{{"resource":"mock-erp://purchase-requests","parameters":{PURCHASE_PARAMETERS}}}"#
+                ),
+                true,
+            ))
+            .await
+            .expect("invoke response");
+        assert_eq!(invoked.status(), StatusCode::ACCEPTED);
+        let invoked_body = body_text(invoked).await;
+        let invoked: Value = serde_json::from_str(&invoked_body).expect("accepted JSON");
+        assert_eq!(invoked["status"], "approval_required");
+        let run_id = invoked["run_id"].as_str().expect("run id").to_owned();
+        let approval_id = invoked["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_owned();
+        let approval_revision = invoked["approval_revision"].as_u64().expect("revision");
+
+        // 2. Read-only budget and vendor reads answer immediately without
+        //    writing anything.
+        let budget = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/apps/org.openwork.erp.procurement/capabilities/erp.budget.read/invoke",
+                r#"{"resource":"mock-erp://budget","parameters":{"department":"shanghai-office"}}"#,
+                true,
+            ))
+            .await
+            .expect("budget read");
+        assert_eq!(budget.status(), StatusCode::OK);
+        let budget_body = body_text(budget).await;
+        assert!(budget_body.contains("290000"));
+
+        // 3. Approvals expose the exact-bound reviewed capability and its
+        //    parameters so the workspace renderer can display the request.
+        let approvals = router
+            .clone()
+            .oneshot(request(Method::GET, "/v1/approvals", "", true))
+            .await
+            .expect("approvals list");
+        let approvals: Value =
+            serde_json::from_str(&body_text(approvals).await).expect("approvals JSON");
+        let pending = approvals
+            .as_array()
+            .expect("approval array")
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(approval_id.as_str()))
+            .expect("pending approval");
+        assert_eq!(pending["status"], "pending");
+        assert_eq!(pending["capability"], "erp.purchase_request.create");
+        assert_eq!(pending["parameters"]["quantity"], 20);
+
+        // 4. Denial path: a second request must never reach the ERP write.
+        let denied_invoke = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v1/apps/org.openwork.erp.procurement/capabilities/erp.purchase_request.create/invoke",
+                &format!(
+                    r#"{{"resource":"mock-erp://purchase-requests","parameters":{PURCHASE_PARAMETERS}}}"#
+                ),
+                true,
+            ))
+            .await
+            .expect("deny invoke response");
+        assert_eq!(denied_invoke.status(), StatusCode::ACCEPTED);
+        let denied_invoke: Value =
+            serde_json::from_str(&body_text(denied_invoke).await).expect("deny JSON");
+        let denied_run_id = denied_invoke["run_id"].as_str().expect("deny run");
+        let denied_approval_id = denied_invoke["approval_id"]
+            .as_str()
+            .expect("deny approval");
+        let denied = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/approvals/{denied_approval_id}/deny"),
+                r#"{"expected_revision":0,"reason":"budget reallocation"}"#,
+                true,
+            ))
+            .await
+            .expect("deny decision");
+        assert_eq!(denied.status(), StatusCode::OK);
+        let denied_execute = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/approvals/{denied_approval_id}/execute"),
+                r#"{"expected_revision":0}"#,
+                true,
+            ))
+            .await
+            .expect("denied execute response");
+        assert_eq!(
+            denied_execute.status(),
+            StatusCode::CONFLICT,
+            "a denied approval must never execute"
+        );
+
+        // 5. Approved execution consumes the single-use claim and creates the
+        //    mock ERP request with a stable reference.
+        let approved = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/approvals/{approval_id}/approve"),
+                r#"{"expected_revision":0,"reason":"within FY2026 budget"}"#,
+                true,
+            ))
+            .await
+            .expect("approve decision");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved_body: Value =
+            serde_json::from_str(&body_text(approved).await).expect("approved JSON");
+        let approved_revision = approved_body["revision"]
+            .as_u64()
+            .expect("approved revision");
+        let executed = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/approvals/{approval_id}/execute"),
+                &format!(r#"{{"expected_revision":{approved_revision}}}"#),
+                true,
+            ))
+            .await
+            .expect("execute response");
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed: Value =
+            serde_json::from_str(&body_text(executed).await).expect("execute JSON");
+        assert_eq!(executed["output"]["erp_request_id"], "PR-2026-0001");
+
+        // 6. Replay is rejected: the claim is single-use.
+        let replay = router
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/v1/approvals/{approval_id}/execute"),
+                &format!(r#"{{"expected_revision":{approval_revision}}}"#),
+                true,
+            ))
+            .await
+            .expect("replay response");
+        assert_eq!(
+            replay.status(),
+            StatusCode::CONFLICT,
+            "single-use claim must reject replay"
+        );
+
+        // 7. The run carries the ERP reference and generated artifacts.
+        let run_detail = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/v1/runs/{run_id}"),
+                "",
+                true,
+            ))
+            .await
+            .expect("run detail");
+        let run_detail: Value =
+            serde_json::from_str(&body_text(run_detail).await).expect("run JSON");
+        assert_eq!(run_detail["status"], "succeeded");
+        let artifacts = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/v1/runs/{run_id}/artifacts"),
+                "",
+                true,
+            ))
+            .await
+            .expect("artifacts");
+        assert_eq!(artifacts.status(), StatusCode::OK);
+        let artifacts: Value =
+            serde_json::from_str(&body_text(artifacts).await).expect("artifacts JSON");
+        let artifact_list = artifacts.as_array().expect("artifact array");
+        let markdown = artifact_list
+            .iter()
+            .find(|item| item["media_type"] == "text/markdown")
+            .expect("markdown artifact");
+        let spreadsheet = artifact_list
+            .iter()
+            .find(|item| {
+                item["media_type"]
+                    == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            })
+            .expect("xlsx artifact");
+        assert!(spreadsheet["size_bytes"].as_u64().expect("size") > 0);
+
+        // 8. The markdown preview endpoint returns human-readable bytes.
+        let preview = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!(
+                    "/v1/runs/{run_id}/artifacts/{}/content",
+                    markdown["id"].as_str().expect("markdown id")
+                ),
+                "",
+                true,
+            ))
+            .await
+            .expect("markdown preview");
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview_text = body_text(preview).await;
+        assert!(preview_text.contains("PR-2026-0001"));
+        assert!(preview_text.contains("Shanghai Display Supply"));
+
+        // 9. The denied run never wrote to ERP: only PR-2026-0001 exists and
+        //    the denied run ended failed without artifacts.
+        let denied_run = router
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                &format!("/v1/runs/{denied_run_id}"),
+                "",
+                true,
+            ))
+            .await
+            .expect("denied run");
+        let denied_run: Value =
+            serde_json::from_str(&body_text(denied_run).await).expect("denied run JSON");
+        // A denied approval never executes: the run stays awaiting approval and
+        // the ERP write count remains unchanged.
+        assert_eq!(denied_run["status"], "awaiting_approval");
+
+        // 10. The full audit trail is present and contains no secret material.
+        let events = router
+            .oneshot(request(
+                Method::GET,
+                &format!("/v1/runs/{run_id}/events"),
+                "",
+                true,
+            ))
+            .await
+            .expect("audit events");
+        assert_eq!(events.status(), StatusCode::OK);
+        let events: Value = serde_json::from_str(&body_text(events).await).expect("events JSON");
+        let event_types = events
+            .as_array()
+            .expect("event array")
+            .iter()
+            .map(|item| item["event_type"].as_str().expect("event type"))
+            .collect::<Vec<_>>();
+        for expected in [
+            "action_requested",
+            "approval_requested",
+            "approval_approved",
+            "approval_consumed",
+            "action_executed",
+            "artifact_created",
+            "run_completed",
+        ] {
+            assert!(
+                event_types.contains(&expected),
+                "missing audit event {expected} in {event_types:?}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(&events)
+                .expect("events serialization")
+                .contains("li.wei@example.invalid")
+        );
     }
 }

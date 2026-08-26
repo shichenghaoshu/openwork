@@ -1,9 +1,34 @@
 # OpenWork current state
 
 This is the repository's evidence-scoped status source. It was refreshed on
-2026-08-23 for the App Platform integration.
+2026-08-27 for the credential boundary, durable prompt recovery, and governed
+procurement workflow integrations.
 
 ## Working
+
+- A reviewed `SecretStore` (Postgres production backend + deterministic memory
+  backend) owns credential values sealed with ChaCha20-Poly1305 under the
+  shared key boundary. GitHub and Feishu/Lark connectors resolve their
+  credential slots through it; a stored credential is authoritative, and
+  revoked or expired credentials fail closed without operator-env fallback.
+  Admin API/UI exposes credential status and rotate/revoke/enable only — raw
+  values never reach API, audit, logs, or serialization
+  (`docs/admin/credentials.md`).
+- Durable encrypted prompt recovery is available as the durable delivery mode:
+  a `prompt_envelopes` row binds run ID, digest, key, nonce, ciphertext, and a
+  24h expiry; decryption happens only in the worker boundary before stdin, and
+  single-use consumption is atomic. Corrupt, expired, and replayed envelopes
+  fail closed; lifecycle is audited without prompt material. `OPENWORK_PROMPT_DELIVERY=durable`
+  requires `OPENWORK_CRYPTO_KEY_PROMPT_ENVELOPE_V1` or the service refuses to
+  start (`docs/admin/prompt-recovery.md`).
+- `org.openwork.erp.procurement` ships the governed procurement demo: read-only
+  budget/vendor/item capabilities plus an L3 `erp.purchase_request.create` that
+  enters AwaitingApproval with exact parameter binding, consumes a single-use
+  approval claim, creates a deterministic mock ERP request (`PR-2026-0001`),
+  and attaches Markdown + XLSX artifacts. Denial never writes; replay is
+  rejected; the full audit trail is redacted. A real ERP implements the
+  `ErpAdapter` boundary without changing policy or approval semantics
+  (`docs/admin/procurement.md`).
 
 - Employee Workspace has Workspace, Tasks, Files, Apps, and Approvals, plus
   administrator Runtime, App Store, and Settings views. Its Electron renderer
@@ -77,19 +102,21 @@ This is the repository's evidence-scoped status source. It was refreshed on
 - Runtime provider images must still be built, provenance-checked, digest-pinned,
   supplied with their provider authentication, and validated in the target
   deployment. OpenWork deliberately does not run these CLIs directly on the host.
-- The current GitHub credential source is a scoped token supplied by the
-  operator. A GitHub App installation/OAuth lifecycle and installation-token
-  rotation are not yet implemented.
+- Stored credentials still accept operator-supplied token material; a GitHub
+  App installation/OAuth lifecycle and installation-token rotation are not yet
+  implemented. The credential boundary itself (SecretStore, broker, metadata,
+  revoke/rotate) is delivered.
 - Installed/enabled App state and the default Runtime setting are process-local;
   reviewed manifests and external capability actions are durable, but those
   administrator preferences need a database migration before multi-instance use.
-- Prompt handoff is one-time and process-local, so restart loses undelivered
-  prompt material and the worker fails closed. Durable encrypted prompt recovery
-  remains a pilot-readiness requirement.
+- Durable prompt recovery is delivered and exercised against Postgres, but a
+  full live restart of the deployed Control API + worker with a real provider
+  still needs target-deployment validation. The `memory` mode remains the
+  local-development default; `durable` mode is the pilot-ready setting.
 - The external action reservation provides replay refusal and at-most-once
   behavior. A crash between remote success and local reconciliation is reported
   as uncertain; it cannot provide universal exactly-once semantics without an
   upstream idempotency key.
-- Enterprise pilot readiness still requires target-provider and Feishu live
-  validation, secret-store integration, deployment observability, backup/restore,
-  and external security review.
+- The procurement flow runs against the deterministic mock ERP adapter and a
+  real live-feishu/procurement demo still needs a real ERP adapter and
+  deployment observability, backup/restore, and external security review.

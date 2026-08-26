@@ -25,6 +25,8 @@ export interface Approval {
   expires_at: string
   status: string
   revision: number
+  capability?: string | null
+  parameters?: Record<string, unknown> | null
   decision?: { decision: string; actor: string; reason?: string | null; decided_at: string } | null
 }
 
@@ -66,4 +68,16 @@ export interface RuntimeInfo {
   status?: string
   description?: string
   [key: string]: unknown
+}
+
+export interface CredentialMetadata {
+  credential_ref: string
+  provider: string
+  environment_variable: string
+  scope: string
+  owner: string
+  created_at: string
+  expires_at?: string | null
+  disabled_at?: string | null
+  revision: number
 }

@@ -1,5 +1,5 @@
 import type { OpenworkApi, BridgeResponse } from '../electron/preload'
-import type { Approval, Connector, ConnectorTool, Run, RuntimeInfo, WorkspaceApp, WorkspaceFile } from './types'
+import type { Approval, Connector, ConnectorTool, CredentialMetadata, Run, RuntimeInfo, WorkspaceApp, WorkspaceFile } from './types'
 
 declare global {
   interface Window { openwork: OpenworkApi }
@@ -77,6 +77,7 @@ export const api = {
   getRun: getRunDetail,
   cancelRun: async (id: string): Promise<{ status: string; confirmed: boolean }> => unwrap(await window.openwork.cancelRun(id)),
   listApprovals: async (): Promise<Approval[]> => unwrap(await window.openwork.listApprovals()),
+  artifactContent: async (runId: string, artifactId: string): Promise<string> => String(unwrap(await window.openwork.artifactContent(runId, artifactId))),
   decideApproval: async (id: string, expected_revision: number, decision: 'approve' | 'deny', reason?: string): Promise<Approval> =>
     unwrap(await window.openwork.decideApproval(id, { expected_revision, reason: reason || undefined }, decision)),
   listConnectors: async (): Promise<Connector[]> => unwrap(await window.openwork.listConnectors()),
@@ -91,4 +92,13 @@ export const api = {
   getSettings: async (): Promise<Record<string, unknown>> => unwrap(await window.openwork.getSettings()),
   updateSettings: async (default_runtime: string): Promise<Record<string, unknown>> =>
     unwrap(await window.openwork.updateSettings({ default_runtime })),
+  listCredentials: async (): Promise<CredentialMetadata[]> => unwrap<CredentialMetadata[]>(await window.openwork.listCredentials()),
+  createCredential: async (body: { credential_ref: string; provider: string; environment_variable: string; scope: string; owner: string; value: string; expires_at?: string }): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.createCredential(body)),
+  rotateCredential: async (id: string, value: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.rotateCredential(id, value)),
+  revokeCredential: async (id: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.revokeCredential(id)),
+  enableCredential: async (id: string): Promise<CredentialMetadata> =>
+    unwrap(await window.openwork.enableCredential(id)),
 }
