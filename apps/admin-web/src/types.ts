@@ -25,6 +25,8 @@ export interface Approval {
   expires_at: string
   status: string
   revision: number
+  capability?: string | null
+  parameters?: Record<string, unknown> | null
   decision?: { decision: string; actor: string; reason?: string | null; decided_at: string } | null
 }
 

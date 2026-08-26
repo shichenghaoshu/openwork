@@ -65,6 +65,26 @@ async function controlRequest(
   }
 }
 
+/** Read-only text endpoint for artifact previews. Raw bytes are never parsed
+ * as JSON; the renderer receives the text as `data`. */
+async function controlRequestText(
+  method: HttpMethod,
+  endpoint: string,
+): Promise<BridgeResponse> {
+  try {
+    const { baseUrl, token } = controlApiConfig()
+    const response = await fetch(new URL(endpoint, baseUrl), {
+      method,
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    const text = await response.text()
+    if (response.ok) return { ok: true, status: response.status, data: text }
+    return { ok: false, status: response.status, error: text || `Control API request failed (${response.status})` }
+  } catch (error) {
+    return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 async function uploadFile(
   name: string,
   mimeType: string,
@@ -126,6 +146,11 @@ function registerIpc(): void {
   )
   ipcMain.handle('control:listRunArtifacts', (_event, id: string) =>
     validId(id) ? controlRequest('GET', `/v1/runs/${id}/artifacts`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),
+  )
+  ipcMain.handle('control:artifactContent', (_event, runId: string, artifactId: string) =>
+    validId(runId) && validId(artifactId)
+      ? controlRequestText('GET', `/v1/runs/${runId}/artifacts/${artifactId}/content`)
+      : Promise.resolve({ ok: false, status: 400, error: 'Invalid artifact ID.' }),
   )
   ipcMain.handle('control:listRunEvents', (_event, id: string) =>
     validId(id) ? controlRequest('GET', `/v1/runs/${id}/events`) : Promise.resolve({ ok: false, status: 400, error: 'Invalid run ID.' }),

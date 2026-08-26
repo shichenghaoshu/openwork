@@ -5,11 +5,12 @@ use std::path::PathBuf;
 fn checked_in_app_registry_is_valid_and_complete() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../registry/apps");
     let registry = AppRegistry::load(&directory).expect("checked-in app registry");
-    assert_eq!(registry.list().len(), 3);
+    assert_eq!(registry.list().len(), 4);
     for id in [
         "org.openwork.github",
         "org.openwork.feishu",
         "org.openwork.libreoffice",
+        "org.openwork.erp.procurement",
     ] {
         assert!(
             registry.get(&AppId::parse(id).expect("app id")).is_some(),

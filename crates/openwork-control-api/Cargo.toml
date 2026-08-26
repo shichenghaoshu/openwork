@@ -14,6 +14,7 @@ openwork-execution = { path = "../openwork-execution", features = ["postgres"] }
 openwork-runtime = { path = "../openwork-runtime" }
 openwork-sandbox = { path = "../openwork-sandbox" }
 openwork-worker = { path = "../openwork-worker" }
+rust_xlsxwriter.workspace = true
 jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true

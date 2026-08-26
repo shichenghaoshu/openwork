@@ -180,6 +180,7 @@ fn media_type(path: &Path) -> &'static str {
         Some("json") => "application/json",
         Some("md") => "text/markdown",
         Some("txt") => "text/plain",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/octet-stream",
     }
 }

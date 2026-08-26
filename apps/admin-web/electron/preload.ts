@@ -13,6 +13,7 @@ const api = {
     ipcRenderer.invoke('control:createRun', body),
   getRun: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:getRun', id),
   listRunArtifacts: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:listRunArtifacts', id),
+  artifactContent: (runId: string, artifactId: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:artifactContent', runId, artifactId),
   listRunEvents: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:listRunEvents', id),
   cancelRun: (id: string): Promise<BridgeResponse> => ipcRenderer.invoke('control:cancelRun', id),
   listApprovals: (): Promise<BridgeResponse> => ipcRenderer.invoke('control:listApprovals'),
