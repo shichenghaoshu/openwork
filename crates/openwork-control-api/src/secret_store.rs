@@ -5,6 +5,7 @@
 //! observability queries select metadata columns only, so raw credential
 //! material is never part of a normal API, audit, log, or serialization path.
 
+use crate::block_on;
 use openwork_apps::{CredentialMetadata, ScopedCredential, SecretStore, SecretStoreEntry};
 use openwork_core::crypto::{EncryptedValue, KeyProvider};
 use openwork_core::{ErrorCode, OpenWorkError};
@@ -152,7 +153,7 @@ impl SecretStore for PostgresSecretStore {
             sqlx::query(
                 "UPDATE credentials SET \
                     encrypted_value = $2, key_id = $3, updated_at = now(), \
-                    revision = revision + 1, disabled_at = NULL \
+                    revision = revision + 1 \
                  WHERE credential_ref = $1 \
                  RETURNING credential_ref, provider, environment_variable, scope, owner, \
                            created_at, expires_at, disabled_at, revision",
@@ -169,15 +170,11 @@ impl SecretStore for PostgresSecretStore {
     }
 
     fn revoke(&self, credential_ref: &str) -> Result<CredentialMetadata, OpenWorkError> {
-        set_disabled_at(
-            self.pool.clone(),
-            credential_ref,
-            Some(UtcTimestamp::now().to_rfc3339_string()),
-        )
+        set_disabled_at(self.pool.clone(), credential_ref, true)
     }
 
     fn enable(&self, credential_ref: &str) -> Result<CredentialMetadata, OpenWorkError> {
-        set_disabled_at(self.pool.clone(), credential_ref, None)
+        set_disabled_at(self.pool.clone(), credential_ref, false)
     }
 }
 
@@ -252,19 +249,20 @@ fn metadata_from_row(row: &PgRow) -> CredentialMetadata {
 fn set_disabled_at(
     pool: PgPool,
     credential_ref: &str,
-    disabled_at: Option<String>,
+    disabled: bool,
 ) -> Result<CredentialMetadata, OpenWorkError> {
     validate_credential_ref(credential_ref)?;
     let owned_ref = credential_ref.to_owned();
     let row = block_on(async move {
         sqlx::query(
-            "UPDATE credentials SET disabled_at = $2, updated_at = now() \
+            "UPDATE credentials \
+                SET disabled_at = CASE WHEN $2 THEN now() ELSE NULL END, updated_at = now() \
              WHERE credential_ref = $1 \
              RETURNING credential_ref, provider, environment_variable, scope, owner, \
                        created_at, expires_at, disabled_at, revision",
         )
         .bind(&owned_ref)
-        .bind(disabled_at)
+        .bind(disabled)
         .fetch_optional(&pool)
         .await
     })
@@ -314,7 +312,7 @@ fn validate_entry(entry: &SecretStoreEntry) -> Result<SecretStoreEntry, OpenWork
             "credential environment variable is invalid",
         ));
     }
-    if entry.scope.is_empty() || entry.scope.len() > 512 {
+    if entry.scope.is_empty() || entry.scope.len() > 255 {
         return Err(credential_error("credential scope is invalid"));
     }
     if entry.owner.is_empty() || entry.owner.len() > 128 {
@@ -343,30 +341,6 @@ fn store_error(message: &'static str) -> OpenWorkError {
 }
 
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
-
-/// Runs an owned database future from synchronous or Tokio-backed callers.
-fn block_on<F>(future: F) -> F::Output
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(future))
-        }
-        Ok(_) => std::thread::spawn(move || database_runtime().block_on(future))
-            .join()
-            .expect("database runtime thread panicked"),
-        Err(_) => database_runtime().block_on(future),
-    }
-}
-
-fn database_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("database runtime must initialize")
-}
 
 #[cfg(test)]
 mod tests {

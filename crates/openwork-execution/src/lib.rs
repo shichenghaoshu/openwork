@@ -456,6 +456,10 @@ pub enum AuditEventType {
     ApprovalBindingMismatch,
     CancelRequested,
     CancelConfirmed,
+    PromptEnvelopeStored,
+    PromptEnvelopeConsumed,
+    PromptEnvelopeExpired,
+    PromptEnvelopeCorrupt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1844,6 +1848,10 @@ const fn audit_event_type_name(event_type: AuditEventType) -> &'static str {
         AuditEventType::ApprovalBindingMismatch => "approval_binding_mismatch",
         AuditEventType::CancelRequested => "cancel_requested",
         AuditEventType::CancelConfirmed => "cancel_confirmed",
+        AuditEventType::PromptEnvelopeStored => "prompt_envelope_stored",
+        AuditEventType::PromptEnvelopeConsumed => "prompt_envelope_consumed",
+        AuditEventType::PromptEnvelopeExpired => "prompt_envelope_expired",
+        AuditEventType::PromptEnvelopeCorrupt => "prompt_envelope_corrupt",
     }
 }
 

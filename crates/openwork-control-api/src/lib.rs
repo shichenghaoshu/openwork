@@ -51,7 +51,11 @@ use openwork_apps::{CredentialMetadata, MemorySecretStore, SecretStore, SecretSt
 use openwork_core::crypto::EnvironmentKeyProvider;
 use secret_store::PostgresSecretStore;
 
-mod secret_store;
+mod prompt_envelope;
+pub mod secret_store;
+
+use openwork_core::crypto::KeyProvider;
+pub use prompt_envelope::DurablePromptDelivery;
 
 const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 const PROMPT_DELIVERY_CAPACITY: usize = 128;
@@ -191,12 +195,29 @@ struct RouterDependencies {
 /// process restart creates an empty implementation, so a worker must fail
 /// closed if its durable run has no matching prompt delivery entry.
 pub trait PromptDelivery: Send + Sync {
+    /// Publishes one prompt after its run is durably created, keyed by run ID
+    /// and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe-to-log error without retaining prompt bytes when the
+    /// backend is full, the digest does not match, the run is already
+    /// published, or the backing store is unavailable.
+    fn register_prompt(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError>;
+
     /// Takes one prompt only when its run ID and persisted digest both match.
     ///
     /// # Errors
     ///
     /// Returns an availability error for an expired, consumed, unknown, or
-    /// restarted entry; or a binding error when the digest does not match.
+    /// restarted entry; a binding error when the digest does not match; or a
+    /// corruption error when the stored envelope cannot be authenticated.
     fn take_prompt(
         &self,
         run_id: &RunId,
@@ -218,6 +239,7 @@ pub enum PromptDeliveryError {
     DuplicateRun,
     DigestMismatch,
     Unavailable,
+    Corrupt,
 }
 
 /// A consumed prompt whose backing bytes are cleared when dropped.
@@ -261,6 +283,14 @@ impl SecretBytes {
     fn into_vec(mut self) -> Vec<u8> {
         std::mem::take(&mut self.0)
     }
+
+    fn from_vec(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl Drop for SecretBytes {
@@ -294,23 +324,36 @@ pub struct InMemoryPromptDelivery {
 /// sleeps or retries. This remains process-local and does not survive restart.
 pub struct SharedPromptBoundary {
     creation_gate: Mutex<()>,
-    delivery: InMemoryPromptDelivery,
+    delivery: Box<dyn PromptDelivery>,
 }
 
 impl SharedPromptBoundary {
-    /// Builds a shared creation gate around a bounded prompt broker.
+    /// Builds a shared creation gate around a prompt broker.
     #[must_use]
-    pub fn new(delivery: InMemoryPromptDelivery) -> Self {
+    pub fn new(delivery: impl PromptDelivery + 'static) -> Self {
         Self {
             creation_gate: Mutex::new(()),
-            delivery,
+            delivery: Box::new(delivery),
         }
     }
 
-    /// Creates the production shared gate and bounded prompt broker.
+    /// Creates the production shared gate and process-local bounded broker.
+    ///
+    /// This is the local/test backend: restart loses undelivered prompts and
+    /// workers fail closed, exactly as before.
     #[must_use]
     pub fn production() -> Self {
         Self::new(InMemoryPromptDelivery::production())
+    }
+
+    /// Creates the durable encrypted envelope broker over Postgres.
+    #[must_use]
+    pub fn durable(
+        pool: PgPool,
+        keys: Arc<dyn KeyProvider>,
+        store: PostgresExecutionStore,
+    ) -> Self {
+        Self::new(DurablePromptDelivery::new(pool, keys, store))
     }
 
     /// Executes a worker claim-and-take closure only after publication is complete.
@@ -329,18 +372,18 @@ impl SharedPromptBoundary {
             .creation_gate
             .lock()
             .map_err(|_| PromptDeliveryError::Unavailable)?;
-        Ok(claim_and_take(&self.delivery))
+        Ok(claim_and_take(self.delivery.as_ref()))
     }
 
     fn with_creation_gate<T>(
         &self,
-        publish: impl FnOnce(&InMemoryPromptDelivery) -> T,
+        publish: impl FnOnce(&dyn PromptDelivery) -> T,
     ) -> Result<T, PromptDeliveryError> {
         let _gate = self
             .creation_gate
             .lock()
             .map_err(|_| PromptDeliveryError::Unavailable)?;
-        Ok(publish(&self.delivery))
+        Ok(publish(self.delivery.as_ref()))
     }
 }
 
@@ -355,6 +398,50 @@ impl InMemoryPromptDelivery {
         )
     }
 
+    /// Registers the raw prompt only after its run has been durably created.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe-to-log error without retaining prompt bytes on failure.
+    fn register_bounded(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError> {
+        if self.capacity == 0 || prompt.len() > self.max_bytes {
+            return Err(PromptDeliveryError::CapacityExceeded);
+        }
+        let actual: [u8; 32] = Sha256::digest(prompt).into();
+        let actual = Sha256Digest::parse(hex_digest(actual))
+            .expect("SHA-256 output is always a valid lowercase digest");
+        if !digest_matches(&actual, expected_sha256) {
+            return Err(PromptDeliveryError::DigestMismatch);
+        }
+        let expires_at = expiry(now, self.ttl).ok_or(PromptDeliveryError::Unavailable)?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| PromptDeliveryError::Unavailable)?;
+        purge_expired_locked(&mut entries, now);
+        if entries.contains_key(run_id) {
+            return Err(PromptDeliveryError::DuplicateRun);
+        }
+        if entries.len() >= self.capacity {
+            return Err(PromptDeliveryError::CapacityExceeded);
+        }
+        entries.insert(
+            run_id.clone(),
+            StoredPrompt {
+                digest: expected_sha256.clone(),
+                expires_at,
+                bytes: SecretBytes::from_vec(prompt.to_vec()),
+            },
+        );
+        Ok(())
+    }
+
     /// Creates a bounded handoff. This is public for worker injection and tests.
     #[must_use]
     pub fn new(capacity: usize, max_bytes: usize, ttl: Duration) -> Self {
@@ -365,53 +452,19 @@ impl InMemoryPromptDelivery {
             entries: Mutex::new(BTreeMap::new()),
         }
     }
-
-    /// Registers the raw prompt only after its run has been durably created.
-    ///
-    /// # Errors
-    ///
-    /// Returns a safe-to-log error without retaining prompt bytes on failure.
-    fn register_prompt(
-        &self,
-        run_id: RunId,
-        expected_sha256: Sha256Digest,
-        bytes: SecretBytes,
-        now: UtcTimestamp,
-    ) -> Result<(), PromptDeliveryError> {
-        if self.capacity == 0 || bytes.0.len() > self.max_bytes {
-            return Err(PromptDeliveryError::CapacityExceeded);
-        }
-        let actual: [u8; 32] = Sha256::digest(&bytes.0).into();
-        let actual = Sha256Digest::parse(hex_digest(actual))
-            .expect("SHA-256 output is always a valid lowercase digest");
-        if !digest_matches(&actual, &expected_sha256) {
-            return Err(PromptDeliveryError::DigestMismatch);
-        }
-        let expires_at = expiry(now, self.ttl).ok_or(PromptDeliveryError::Unavailable)?;
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| PromptDeliveryError::Unavailable)?;
-        purge_expired_locked(&mut entries, now);
-        if entries.contains_key(&run_id) {
-            return Err(PromptDeliveryError::DuplicateRun);
-        }
-        if entries.len() >= self.capacity {
-            return Err(PromptDeliveryError::CapacityExceeded);
-        }
-        entries.insert(
-            run_id,
-            StoredPrompt {
-                digest: expected_sha256,
-                expires_at,
-                bytes,
-            },
-        );
-        Ok(())
-    }
 }
 
 impl PromptDelivery for InMemoryPromptDelivery {
+    fn register_prompt(
+        &self,
+        run_id: &RunId,
+        expected_sha256: &Sha256Digest,
+        prompt: &[u8],
+        now: UtcTimestamp,
+    ) -> Result<(), PromptDeliveryError> {
+        self.register_bounded(run_id, expected_sha256, prompt, now)
+    }
+
     fn take_prompt(
         &self,
         run_id: &RunId,
@@ -479,6 +532,32 @@ fn hex_digest(bytes: [u8; 32]) -> String {
 
 fn digest_matches(left: &Sha256Digest, right: &Sha256Digest) -> bool {
     bool::from(left.as_str().as_bytes().ct_eq(right.as_str().as_bytes()))
+}
+
+/// Runs an owned database future from synchronous or Tokio-backed callers.
+/// Multi-thread runtimes can safely use `block_in_place`; a current-thread
+/// runtime delegates to a dedicated thread so its sole executor is not blocked.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || database_runtime().block_on(future))
+            .join()
+            .expect("database runtime thread panicked"),
+        Err(_) => database_runtime().block_on(future),
+    }
+}
+
+fn database_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("database runtime must initialize")
 }
 
 /// Boundary between HTTP cancellation intent and the durable execution worker.
@@ -560,8 +639,23 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let recovery_time = UtcTimestamp::now();
     store.recover_expired_leases(recovery_actor.clone(), recovery_time)?;
     store.recover_interrupted_runs(recovery_actor, recovery_time)?;
-    let prompts = Arc::new(SharedPromptBoundary::production());
-    let keys: Arc<dyn openwork_core::crypto::KeyProvider> = Arc::new(EnvironmentKeyProvider::new());
+    let keys: Arc<dyn KeyProvider> = Arc::new(EnvironmentKeyProvider::new());
+    let prompts = if env::var("OPENWORK_PROMPT_DELIVERY").as_deref() == Ok("durable") {
+        // A missing envelope key is a startup configuration error so a
+        // deployment can never silently regress to process-local handoff.
+        keys.key("prompt-envelope-v1").map_err(|_| {
+            ConfigError(
+                "OPENWORK_PROMPT_DELIVERY=durable requires OPENWORK_CRYPTO_KEY_PROMPT_ENVELOPE_V1",
+            )
+        })?;
+        Arc::new(SharedPromptBoundary::durable(
+            pool.clone(),
+            Arc::clone(&keys),
+            store.clone(),
+        ))
+    } else {
+        Arc::new(SharedPromptBoundary::production())
+    };
     let secret_store: Arc<dyn SecretStore> = Arc::new(PostgresSecretStore::new(pool.clone(), keys));
     let connectors = Arc::new(ConnectorRegistry::with_secret_store(
         config.connectors,
@@ -1463,9 +1557,9 @@ async fn create_run(
                 .map_err(|_| ApiError::internal())?;
             if delivery
                 .register_prompt(
-                    run.id.clone(),
-                    run.prompt_sha256.clone(),
-                    prompt,
+                    &run.id,
+                    &run.prompt_sha256,
+                    prompt.as_bytes(),
                     UtcTimestamp::now(),
                 )
                 .is_err()
@@ -2133,12 +2227,7 @@ mod tests {
         let now = timestamp("2026-08-22T00:00:00Z");
 
         delivery
-            .register_prompt(
-                run_id.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            )
+            .register_prompt(&run_id, &expected, prompt.as_bytes(), now)
             .expect("register prompt");
         assert!(matches!(
             delivery.take_prompt(&run_id, &wrong, now),
@@ -2166,29 +2255,14 @@ mod tests {
         let delivery = InMemoryPromptDelivery::new(1, 16, Duration::from_secs(1));
 
         delivery
-            .register_prompt(
-                first.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            )
+            .register_prompt(&first, &expected, prompt.as_bytes(), now)
             .expect("first prompt fits");
         assert_eq!(
-            delivery.register_prompt(
-                first.clone(),
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&first, &expected, prompt.as_bytes(), now),
             Err(PromptDeliveryError::DuplicateRun)
         );
         assert_eq!(
-            delivery.register_prompt(
-                second,
-                expected.clone(),
-                SecretBytes::from_string(prompt.to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&second, &expected, prompt.as_bytes(), now),
             Err(PromptDeliveryError::CapacityExceeded)
         );
         let expired = timestamp("2026-08-22T00:00:02Z");
@@ -2211,12 +2285,7 @@ mod tests {
         let delivery = InMemoryPromptDelivery::new(1, 16, Duration::from_mins(1));
         let tampered = RunId::generate();
         assert_eq!(
-            delivery.register_prompt(
-                tampered.clone(),
-                digest("expected"),
-                SecretBytes::from_string("actual".to_owned()),
-                now,
-            ),
+            delivery.register_prompt(&tampered, &digest("expected"), b"actual", now),
             Err(PromptDeliveryError::DigestMismatch)
         );
         assert!(matches!(
@@ -2226,11 +2295,9 @@ mod tests {
         let oversized = RunId::generate();
         assert_eq!(
             delivery.register_prompt(
-                oversized,
-                digest("this value is larger than the bounded prompt slot"),
-                SecretBytes::from_string(
-                    "this value is larger than the bounded prompt slot".to_owned(),
-                ),
+                &oversized,
+                &digest("this value is larger than the bounded prompt slot"),
+                "this value is larger than the bounded prompt slot".as_bytes(),
                 now,
             ),
             Err(PromptDeliveryError::CapacityExceeded)
@@ -2259,12 +2326,7 @@ mod tests {
                     creation_entered_tx.send(()).expect("signal gate held");
                     allow_publish_rx.recv().expect("allow publication");
                     delivery
-                        .register_prompt(
-                            publish_run_id,
-                            publish_digest,
-                            SecretBytes::from_string(prompt.to_owned()),
-                            now,
-                        )
+                        .register_prompt(&publish_run_id, &publish_digest, prompt.as_bytes(), now)
                         .expect("publish prompt before gate release");
                 })
                 .expect("creation gate is healthy");

@@ -445,7 +445,7 @@ fn validate_entry(entry: &SecretStoreEntry) -> Result<SecretStoreEntry, OpenWork
             "credential environment variable is invalid",
         ));
     }
-    if entry.scope.is_empty() || entry.scope.len() > 512 {
+    if entry.scope.is_empty() || entry.scope.len() > 255 {
         return Err(credential_error("credential scope is invalid"));
     }
     if entry.owner.is_empty() || entry.owner.len() > 128 {

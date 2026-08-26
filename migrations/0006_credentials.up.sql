@@ -8,8 +8,10 @@ CREATE TABLE credentials (
     credential_ref TEXT PRIMARY KEY CHECK (credential_ref ~ '^[a-z][a-z0-9._-]{0,127}$'),
     provider TEXT NOT NULL CHECK (provider ~ '^[a-z][a-z0-9._-]{1,128}$'),
     environment_variable TEXT NOT NULL CHECK (environment_variable ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'),
-    scope TEXT NOT NULL CHECK (scope ~ '^[a-z0-9._:/+=+-]{1,512}$'),
-    owner TEXT NOT NULL CHECK (owner ~ '^[a-z0-9._@:/-]{1,128}$'),
+    -- Postgres bracket expressions treat every `a-b` pair as a range, so the
+    -- permitted character sets below are ordered by ascending ASCII.
+    scope TEXT NOT NULL CHECK (scope ~ '^[a-z0-9+,-./:=_]{1,255}$'),
+    owner TEXT NOT NULL CHECK (owner ~ '^[-a-z0-9./:@_]{1,128}$'),
     encrypted_value BYTEA NOT NULL,
     key_id TEXT NOT NULL CHECK (key_id ~ '^[a-z][a-z0-9._-]{0,127}$'),
     created_at TIMESTAMPTZ NOT NULL,
